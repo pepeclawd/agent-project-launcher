@@ -447,31 +447,23 @@ function Get-CodexModelSlugs {
     )
 }
 
-# Claude ships no local model catalogue, so pinned ids are discovered from the
-# ones this machine has actually used. Self-updating, unlike a hard-coded list.
-function Get-ClaudePinnedModels {
-    $configFile = Join-Path $env:USERPROFILE '.claude.json'
-    if (-not (Test-Path -LiteralPath $configFile -PathType Leaf)) { return @() }
-    try {
-        $text = Get-Content -LiteralPath $configFile -Raw -ErrorAction Stop
-    } catch {
-        return @()
-    }
-    $found = @()
-    foreach ($match in [regex]::Matches($text, '"(claude-(?:opus|sonnet|haiku|fable)-[0-9][A-Za-z0-9\-]*)"')) {
-        $id = $match.Groups[1].Value
-        if ($found -notcontains $id) { $found += $id }
-    }
-    return @($found | Sort-Object -Descending)
+# 'claude-opus-5' and the alias 'opus' reach the same model, and the alias keeps
+# reaching it after the next release. Fold a pinned id back onto its alias so the
+# list stays four names long.
+function Get-ClaudeModelAlias {
+    param([string]$Model)
+    if ($Model -match '(?i)^claude-(opus|sonnet|haiku|fable)(?:-|$)') { return $Matches[1].ToLowerInvariant() }
+    return $Model
 }
 
 function Get-ModelChoices {
     param([Parameter(Mandatory)][ValidateSet('Claude', 'Codex')][string]$Name)
     $configured = Get-AgentDefaultModel $Name
     if ($Name -eq 'Claude') {
-        # Aliases first: they follow the latest release on their own. The pinned
-        # ids below stay on one exact version.
-        $slugs = @('opus', 'sonnet', 'haiku', 'fable') + @(Get-ClaudePinnedModels)
+        # Aliases only: each one follows the latest release of that model on its
+        # own, so a version-pinned list would just go stale.
+        $slugs = @('opus', 'sonnet', 'haiku', 'fable')
+        $configured = Get-ClaudeModelAlias $configured
     } else {
         $slugs = @(Get-CodexModelSlugs)
     }
@@ -687,7 +679,7 @@ function Get-LaunchPreview {
 function Get-CompactModelName {
     param([string]$Model)
     if (-not $Model) { return '' }
-    if ($Model -match '(?i)^claude-(opus|sonnet|haiku)(?:-|$)') {
+    if ($Model -match '(?i)^claude-(opus|sonnet|haiku|fable)(?:-|$)') {
         return $Matches[1].ToLowerInvariant()
     }
     return $Model
@@ -786,26 +778,33 @@ function Get-ClaudeTranscriptModel {
         $files = @(Get-ChildItem -LiteralPath $transcriptDirectory -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
         if ($files.Count -eq 0) { return $null }
 
-        # An explicit resume exposes the session id. For new/continued sessions,
-        # creation time normally identifies the file; LastWriteTime is the safe
-        # fallback for an older transcript that was resumed.
+        # An explicit resume exposes the session id. A new session writes its
+        # transcript once the first message is sent, so the file this process
+        # created is the one that appeared at or after it started.
         $sessionId = ''
         if ($CommandLine -match '(?i)\b([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\b') { $sessionId = $Matches[1] }
+        $certain = $false
         if ($sessionId) {
             $transcript = $files | Where-Object { $_.BaseName -eq $sessionId } | Select-Object -First 1
+            if ($transcript) { $certain = $true }
         }
         if (-not $transcript) {
-            $nearStart = @($files | Where-Object {
-                [math]::Abs(($_.CreationTime - $Started).TotalSeconds) -le 180
-            } | Sort-Object @{ Expression = { [math]::Abs(($_.CreationTime - $Started).TotalSeconds) } })
-            if ($nearStart.Count -gt 0) { $transcript = $nearStart[0] }
+            # Only forward in time: a file created before this process belongs to
+            # some earlier session, however close the timestamps happen to be.
+            $ownFiles = @($files | Where-Object { $_.CreationTime -ge $Started.AddSeconds(-5) } |
+                Sort-Object CreationTime)
+            if ($ownFiles.Count -gt 0) { $transcript = $ownFiles[0]; $certain = $true }
         }
         if (-not $transcript) {
+            # '--continue' reopens an older transcript and keeps writing to it.
             $transcript = $files | Where-Object { $_.LastWriteTime -ge $Started.AddMinutes(-5) } |
                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
         }
         if (-not $transcript) { return $null }
-        $script:claudeTranscriptByPid[$pidKey] = $transcript.FullName
+        # A guess is remembered only until the next refresh. Caching it would
+        # pin a session that had not written its transcript yet to whichever
+        # file happened to be newest when the list was first opened.
+        if ($certain) { $script:claudeTranscriptByPid[$pidKey] = $transcript.FullName }
     }
 
     # Transcript lines can contain multi-megabyte tool results. Get-Content
@@ -835,7 +834,13 @@ function Get-ClaudeTranscriptModel {
                 $record = $lines[$index]
                 $prefix = $record
                 if ($prefix.Length -gt 4096) { $prefix = $prefix.Substring(0, 4096) }
-                if ($prefix -match '"type"\s*:\s*"assistant"' -and
+                # The record's own '"type":"assistant"' is written after the
+                # message content, so on any turn longer than the prefix it is
+                # out of reach. The message header is not: role and model sit in
+                # the first few hundred bytes. Subagent turns carry their own
+                # context and must not be mistaken for the session's.
+                if ($prefix -match '"role"\s*:\s*"assistant"' -and
+                    $prefix -notmatch '"isSidechain"\s*:\s*true' -and
                     $prefix -match '"model"\s*:\s*"(claude-[^"\\]+)"') {
                     $activeModel = $Matches[1]
                     $usageStart = $record.LastIndexOf('"usage":', [System.StringComparison]::Ordinal)
@@ -858,7 +863,7 @@ function Get-ClaudeTranscriptModel {
                         if ($record -match 'Context Usage') {
                             # /context is written immediately and includes the
                             # model selected by /model before it has replied.
-                            $contextModel = [regex]::Match($record, 'claude-(?:opus|sonnet|haiku)-[A-Za-z0-9.\-]+')
+                            $contextModel = [regex]::Match($record, 'claude-(?:opus|sonnet|haiku|fable)-[A-Za-z0-9.\-]+')
                             if ($contextModel.Success) { $activeModel = $contextModel.Value }
                         }
                         if ($pendingLocalCommand -eq '/usage') {
@@ -943,10 +948,34 @@ function Get-CodexTranscriptState {
                     if (Test-Path -LiteralPath $candidate -PathType Container) { $workspacePath = $candidate; break }
                 }
             }
-            $nearStart = @($files | Where-Object {
-                [math]::Abs(($_.CreationTime - $Started).TotalSeconds) -le 180
-            } | Sort-Object @{ Expression = { [math]::Abs(($_.CreationTime - $Started).TotalSeconds) } })
+            # Codex names a rollout with the time the CLI session started. On
+            # recent builds the JSONL may be materialized (or atomically
+            # replaced) several minutes later, which makes the Windows file
+            # CreationTime unsuitable for associating it with the process.
+            # Prefer the stable timestamp embedded in the rollout filename and
+            # retain CreationTime as a compatibility fallback for older names.
+            $nearStart = @($files | ForEach-Object {
+                $rolloutStarted = $_.CreationTime
+                $stamp = [regex]::Match($_.Name,
+                    '^rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-')
+                if ($stamp.Success) {
+                    $parsedStamp = [datetime]::MinValue
+                    if ([datetime]::TryParseExact($stamp.Groups[1].Value,
+                        'yyyy-MM-ddTHH-mm-ss',
+                        [System.Globalization.CultureInfo]::InvariantCulture,
+                        [System.Globalization.DateTimeStyles]::AssumeLocal,
+                        [ref]$parsedStamp)) {
+                        $rolloutStarted = $parsedStamp
+                    }
+                }
+                [pscustomobject]@{
+                    File = $_
+                    StartDistance = [math]::Abs(($rolloutStarted - $Started).TotalSeconds)
+                }
+            } | Where-Object { $_.StartDistance -le 180 } |
+                Sort-Object StartDistance)
             foreach ($candidateFile in $nearStart) {
+                $candidateFile = $candidateFile.File
                 $candidateStream = $null
                 $candidateReader = $null
                 try {
@@ -2069,15 +2098,16 @@ $livePanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Window
 [void](New-ThemeText $livePanel '# Live terminal sessions' $edgeL 16 $theme.Section 400)
 $uiLiveRefresh = New-ThemeButton $livePanel 'Refresh' 648 12 124 $theme.Head 1
 $uiLiveRefresh.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
-[void](New-ThemeText $livePanel 'Context health, account limits and launch permissions. Hover any value for details.' $edgeL 44 $theme.Muted 756)
+[void](New-ThemeText $livePanel 'Context usage, account limits and launch permissions. Hover any value for details.' $edgeL 44 $theme.Muted 756)
 
+# Context carries its own health: green below 60%, amber from 60%, red from 80%.
+# A separate column only restated what the colour already says.
 [void](New-ThemeText $livePanel 'Agent'   16 76 $theme.Label 64)
-[void](New-ThemeText $livePanel 'Project' 94 76 $theme.Label 135)
-[void](New-ThemeText $livePanel 'Model' 233 76 $theme.Label 165)
-[void](New-ThemeText $livePanel 'Context' 402 76 $theme.Label 105)
-[void](New-ThemeText $livePanel 'Health' 511 76 $theme.Label 75)
-[void](New-ThemeText $livePanel 'Limits' 590 76 $theme.Label 90)
-[void](New-ThemeText $livePanel 'Permissions' 684 76 $theme.Label 88)
+[void](New-ThemeText $livePanel 'Project' 94 76 $theme.Label 200)
+[void](New-ThemeText $livePanel 'Model' 304 76 $theme.Label 125)
+[void](New-ThemeText $livePanel 'Context' 432 76 $theme.Label 115)
+[void](New-ThemeText $livePanel 'Limits' 551 76 $theme.Label 95)
+[void](New-ThemeText $livePanel 'Permissions' 650 76 $theme.Label 100)
 [void](New-ThemeRule $livePanel 102)
 
 $uiLiveRows = New-Object Launcher.BufferedPanel
@@ -2093,7 +2123,42 @@ $uiLiveSummary.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System
 
 $script:panelHeightCollapsed = 380
 $script:panelHeightExpanded  = $advanced.Top + $advanced.Height + 16
+$script:livePanelHeightMin   = $livePanel.Height
 $script:advancedOpen = $false
+
+# The button row: 16px below the panel, 26px tall, 36px of air beneath it. With
+# a 380px panel that adds up to the 504px the window opens at.
+$script:buttonGap    = 16
+$script:buttonHeight = 26
+$script:buttonPad    = 36
+
+# Start and Cancel are anchored to the bottom edge, so the form has to be
+# resized before they are moved: setting Top first and growing the form after
+# applies the height change twice and drops them below the visible area.
+function Set-ButtonRow {
+    param([int]$PanelTop, [int]$PanelHeight, [int]$MinPanelHeight = 0, [switch]$Exact)
+    if ($MinPanelHeight -le 0) { $MinPanelHeight = $PanelHeight }
+    $below = $script:buttonGap + $script:buttonHeight + $script:buttonPad
+    $required = $PanelTop + $PanelHeight + $below
+    # Without a floor that follows the layout, dragging the window shorter
+    # slides the buttons up behind the panel instead of stopping. The floor is
+    # the panel's smallest useful height, not its current one, or a stretched
+    # live list could never be dragged back down.
+    $chrome = $form.Height - $form.ClientSize.Height
+    $form.MinimumSize = New-Object System.Drawing.Size(
+        $form.MinimumSize.Width, ($PanelTop + $MinPanelHeight + $below + $chrome))
+    $height = $form.ClientSize.Height
+    # Exact for the new-session view, where the panel is a fixed height and any
+    # surplus is empty space: folding Advanced options away gives the window its
+    # old size back. The live list turns surplus into more visible rows, so
+    # there the window is only ever grown to fit.
+    if (($Exact -and $height -ne $required) -or ($height -lt $required)) {
+        $form.ClientSize = New-Object System.Drawing.Size($form.ClientSize.Width, $required)
+    }
+    $buttonTop = $form.ClientSize.Height - $script:buttonPad - $script:buttonHeight
+    $uiStart.Top = $buttonTop
+    $uiCancel.Top = $buttonTop
+}
 
 function Update-Layout {
     if ($script:launcherView -eq 'live') { return }
@@ -2107,13 +2172,7 @@ function Update-Layout {
     # stay painted across the middle of the panel.
     $panel.Refresh()
 
-    $buttonTop = $panel.Top + $panelHeight + 16
-    $uiStart.Top = $buttonTop
-    $uiCancel.Top = $buttonTop
-    $requiredHeight = $buttonTop + 26 + 20
-    if ($form.ClientSize.Height -lt $requiredHeight) {
-        $form.ClientSize = New-Object System.Drawing.Size($form.ClientSize.Width, $requiredHeight)
-    }
+    Set-ButtonRow -PanelTop $panel.Top -PanelHeight $panelHeight -Exact
 }
 
 $uiStart  = New-ThemeButton $form 'Open terminal' 526 442 170 $theme.Section 1
@@ -2340,6 +2399,9 @@ function Load-AgentModel {
     # a model, so fall back to whatever the CLI is configured to use.
     if ($remembered -match '^\s*Default\b') { $remembered = '' }
     if (-not $remembered) { $remembered = Get-AgentDefaultModel $AgentName }
+    # A settings file or CLI config holding a pinned id must not put the version
+    # number back into the list it was just taken out of.
+    if ($AgentName -eq 'Claude') { $remembered = Get-ClaudeModelAlias $remembered }
     if (-not $remembered) { $remembered = Get-ModelSlug ([string]$uiModel.Items[0]) }
     Set-ModelSelection $remembered
 }
@@ -2571,29 +2633,30 @@ function Refresh-LiveSessions {
             $y = 4 + ($rowIndex * 30)
             $agentLabel = New-ThemeText $uiLiveRows $session.Agent 0 $y $theme.Head 64 $fontBase
             $projectText = if ($session.Project) { $session.Project } else { '(unknown)' }
-            $projectLabel = New-ThemeText $uiLiveRows $projectText 78 $y $theme.Head 135 $fontBase
-            $modelLabel = New-ThemeText $uiLiveRows $session.Model 217 $y $theme.Value 165 $fontBase
+            $projectLabel = New-ThemeText $uiLiveRows $projectText 78 $y $theme.Head 200 $fontBase
+            $modelLabel = New-ThemeText $uiLiveRows $session.Model 288 $y $theme.Value 125 $fontBase
             Set-RowTip $modelLabel ('{0} ({1})' -f $session.ModelDetail, $session.ModelSource)
-            $contextLabel = New-ThemeText $uiLiveRows $session.ContextDisplay 386 $y $theme.Value 105 $fontBase
-            $contextTip = if ($session.ContextTokens -gt 0 -and $session.ContextWindow -gt 0) {
-                '{0:N0} of {1:N0} tokens currently used.' -f $session.ContextTokens, $session.ContextWindow
-            } elseif ($session.ContextTokens -gt 0) {
-                '{0:N0} tokens currently used. Claude does not record the context-window limit here.' -f $session.ContextTokens
-            } else { 'No token measurement has been written yet.' }
-            Set-RowTip $contextLabel $contextTip
-            $healthColor = switch ($session.ContextHealth) {
+            # The health reading is the colour of the number now, not a word in a
+            # column of its own.
+            $contextColor = switch ($session.ContextHealth) {
                 'Compact' { $theme.Danger }
                 'Watch'   { $theme.Warning }
                 'OK'      { $theme.Value }
                 default   { $theme.Muted }
             }
-            $healthLabel = New-ThemeText $uiLiveRows $session.ContextHealth 495 $y $healthColor 75 $fontBase
-            Set-RowTip $healthLabel 'OK below 60%; Watch from 60%; Compact from 80%.'
-            $usageLabel = New-ThemeText $uiLiveRows $session.UsageDisplay 574 $y $theme.Head 90 $fontBase
+            $contextLabel = New-ThemeText $uiLiveRows $session.ContextDisplay 416 $y $contextColor 115 $fontBase
+            $contextTip = if ($session.ContextTokens -gt 0 -and $session.ContextWindow -gt 0) {
+                '{0:N0} of {1:N0} tokens currently used.{2}{2}Green below 60%, amber from 60%, red from 80%.' -f
+                    $session.ContextTokens, $session.ContextWindow, "`r`n"
+            } elseif ($session.ContextTokens -gt 0) {
+                '{0:N0} tokens currently used. Claude does not record the context-window limit here.' -f $session.ContextTokens
+            } else { 'No token measurement has been written yet.' }
+            Set-RowTip $contextLabel $contextTip
+            $usageLabel = New-ThemeText $uiLiveRows $session.UsageDisplay 535 $y $theme.Head 95 $fontBase
             Set-RowTip $usageLabel $session.UsageDetail
             # Keep the right edge inside the viewport even when the vertical
             # scrollbar is present; horizontal scrolling is never needed here.
-            $permissionLabel = New-ThemeText $uiLiveRows $session.Permission 668 $y $theme.Head 68 $fontBase
+            $permissionLabel = New-ThemeText $uiLiveRows $session.Permission 634 $y $theme.Head 100 $fontBase
             Set-RowTip $permissionLabel ('Launch permission mode: ' + $session.Permission)
             $projectDetails = @()
             if ($session.Workspace) { $projectDetails += $session.Workspace }
@@ -2633,12 +2696,7 @@ function Set-LauncherView {
         # One fresh snapshot on entry, including Claude's account limits. There
         # is deliberately no timer; subsequent updates remain behind Refresh.
         Refresh-LiveSessions -RefreshAccountUsage
-        $buttonTop = $livePanel.Top + $livePanel.Height + 16
-        $uiCancel.Top = $buttonTop
-        $requiredHeight = $buttonTop + 26 + 20
-        if ($form.ClientSize.Height -lt $requiredHeight) {
-            $form.ClientSize = New-Object System.Drawing.Size($form.ClientSize.Width, $requiredHeight)
-        }
+        Set-ButtonRow -PanelTop $livePanel.Top -PanelHeight $livePanel.Height -MinPanelHeight $script:livePanelHeightMin
         $form.AcceptButton = $uiLiveRefresh
         $uiLiveRefresh.Focus()
     } else {

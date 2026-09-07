@@ -5,8 +5,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $source = $PSScriptRoot
-$repoRoot = Split-Path -Parent (Split-Path -Parent $source)
-$dist = Join-Path $repoRoot 'dist'
+# This script sits at the repository root, so the release drops into the repo's
+# own ignored dist/ folder. Walking up from here put it two directories outside.
+$dist = Join-Path $source 'dist'
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('AgentProjectLauncher-' + [guid]::NewGuid().ToString('N'))
 $package = Join-Path $stage 'AgentProjectLauncher'
 $zip = Join-Path $dist ("AgentProjectLauncher-$Version-Windows.zip")
