@@ -49,7 +49,7 @@ function New-LauncherShortcut {
     param([Parameter(Mandatory)][string]$Path)
     $shortcut = $shell.CreateShortcut($Path)
     $shortcut.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '"'
+    $shortcut.Arguments = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $scriptPath + '"'
     $shortcut.WorkingDirectory = $ProjectRoot
     $shortcut.IconLocation = $iconPath + ',0'
     $shortcut.Description = 'Start a Claude Code or OpenAI Codex session'

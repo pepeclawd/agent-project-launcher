@@ -22,6 +22,53 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName Microsoft.VisualBasic
 Add-Type -AssemblyName System.Net.Http
 
+# WinForms has no built-in "vertical resize only" mode. Translate corner
+# resize handles to top/bottom handles, disable the side handles, and repaint
+# the whole client area while its height changes so old custom borders cannot
+# remain as stripes.
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Windows.Forms;
+
+namespace Launcher {
+    public class VerticalResizeForm : Form {
+        private const int WM_NCHITTEST = 0x0084;
+        private const int HTCLIENT = 1;
+        private const int HTLEFT = 10, HTRIGHT = 11, HTTOP = 12;
+        private const int HTTOPLEFT = 13, HTTOPRIGHT = 14, HTBOTTOM = 15;
+        private const int HTBOTTOMLEFT = 16, HTBOTTOMRIGHT = 17;
+        public bool VerticalResizeOnly { get { return true; } }
+
+        public VerticalResizeForm() {
+            SetStyle(ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void WndProc(ref Message m) {
+            base.WndProc(ref m);
+            if (m.Msg != WM_NCHITTEST) return;
+            int hit = m.Result.ToInt32();
+            if (hit == HTLEFT || hit == HTRIGHT) m.Result = (IntPtr)HTCLIENT;
+            else if (hit == HTTOPLEFT || hit == HTTOPRIGHT) m.Result = (IntPtr)HTTOP;
+            else if (hit == HTBOTTOMLEFT || hit == HTBOTTOMRIGHT) m.Result = (IntPtr)HTBOTTOM;
+        }
+    }
+
+    public class BufferedPanel : Panel {
+        public bool BufferedRendering { get { return true; } }
+        public BufferedPanel() {
+            SetStyle(ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw, true);
+        }
+    }
+}
+'@ -ReferencedAssemblies System.Windows.Forms,System.Drawing -ErrorAction Stop
+} catch { }
+
 $documentsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
 if (-not $documentsRoot) { $documentsRoot = Join-Path $env:USERPROFILE 'Documents' }
 $launcherDataRoot = Join-Path $env:LOCALAPPDATA 'AgentProjectLauncher'
@@ -1257,17 +1304,19 @@ function Set-WindowIcon {
     if ($script:appIcon) { $Window.Icon = $script:appIcon }
 }
 
-$form = New-Object System.Windows.Forms.Form
+$form = New-Object Launcher.VerticalResizeForm
 $form.Text            = 'Start an agent session'
 $form.StartPosition   = 'CenterScreen'
 $form.FormBorderStyle = 'Sizable'
-$form.MaximizeBox     = $true
+$form.MaximizeBox     = $false
 $form.MinimizeBox     = $true
 $form.ClientSize      = New-Object System.Drawing.Size(820, 504)
 $form.MinimumSize     = $form.Size
+$form.MaximumSize     = New-Object System.Drawing.Size($form.Width, [System.Windows.Forms.SystemInformation]::MaxWindowTrackSize.Height)
 $form.Font            = $fontBase
 $form.BackColor       = $theme.Bg
 $form.ForeColor       = $theme.Head
+$form.Opacity         = 0
 $form.Add_HandleCreated({ Set-DarkTitleBar $form })
 Set-WindowIcon $form
 
@@ -1300,7 +1349,7 @@ function New-ThemeText {
 function New-RainbowWordmark {
     param($Parent, [int]$X, [int]$Y)
 
-    $logo = New-Object System.Windows.Forms.Panel
+    $logo = New-Object Launcher.BufferedPanel
     $logo.Location = New-Object System.Drawing.Point($X, $Y)
     $logo.BackColor = $theme.Bg
     $logo.Cursor = [System.Windows.Forms.Cursors]::Hand
@@ -1434,7 +1483,7 @@ function Set-ThemeButtonAvailable {
 function New-ThemeCombo {
     param($Parent, [int]$X, [int]$Y, [int]$Width)
 
-    $outer = New-Object System.Windows.Forms.Panel
+    $outer = New-Object Launcher.BufferedPanel
     $outer.Location = New-Object System.Drawing.Point($X, $Y)
     $outer.Size = New-Object System.Drawing.Size($Width, 26)
     $outer.BackColor = $theme.Field
@@ -1445,7 +1494,7 @@ function New-ThemeCombo {
     })
     $Parent.Controls.Add($outer)
 
-    $clip = New-Object System.Windows.Forms.Panel
+    $clip = New-Object Launcher.BufferedPanel
     $clip.Location = New-Object System.Drawing.Point(1, 1)
     $clip.Size = New-Object System.Drawing.Size(($Width - 2), 24)
     $clip.BackColor = $theme.Field
@@ -1500,7 +1549,7 @@ function New-ThemeCombo {
         @(0, 0, 2, 24),
         @(($Width - 4), 0, 2, 24)
     )) {
-        $mask = New-Object System.Windows.Forms.Panel
+        $mask = New-Object Launcher.BufferedPanel
         $mask.BackColor = $theme.Field
         $mask.Location = New-Object System.Drawing.Point $edge[0], $edge[1]
         $mask.Size = New-Object System.Drawing.Size $edge[2], $edge[3]
@@ -1515,7 +1564,7 @@ function New-ThemeCombo {
 # behind it draws the one the theme wants.
 function New-ThemeTextBox {
     param($Parent, [int]$X, [int]$Y, [int]$Width)
-    $outer = New-Object System.Windows.Forms.Panel
+    $outer = New-Object Launcher.BufferedPanel
     $outer.Location = New-Object System.Drawing.Point($X, $Y)
     $outer.Size = New-Object System.Drawing.Size($Width, 26)
     $outer.BackColor = $theme.Field
@@ -1540,7 +1589,7 @@ function New-ThemeTextBox {
 # colour, which is the one thing the theme cannot override.
 function New-ThemePanel {
     param($Parent, [int]$X, [int]$Y, [int]$Width, [int]$Height, [switch]$Bordered)
-    $panel = New-Object System.Windows.Forms.Panel
+    $panel = New-Object Launcher.BufferedPanel
     $panel.Location = New-Object System.Drawing.Point($X, $Y)
     $panel.Size = New-Object System.Drawing.Size($Width, $Height)
     $panel.BackColor = $theme.Panel
@@ -1915,7 +1964,7 @@ $help = @{
 
 function New-ThemeRule {
     param($Parent, [int]$Y)
-    $rule = New-Object System.Windows.Forms.Panel
+    $rule = New-Object Launcher.BufferedPanel
     $rule.Location = New-Object System.Drawing.Point($edgeL, $Y)
     $rule.Size = New-Object System.Drawing.Size(($edgeR - $edgeL), 1)
     $rule.BackColor = $theme.Border
@@ -2031,7 +2080,7 @@ $uiLiveRefresh.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Wi
 [void](New-ThemeText $livePanel 'Permissions' 684 76 $theme.Label 88)
 [void](New-ThemeRule $livePanel 102)
 
-$uiLiveRows = New-Object System.Windows.Forms.Panel
+$uiLiveRows = New-Object Launcher.BufferedPanel
 $uiLiveRows.Location = New-Object System.Drawing.Point(16, 108)
 $uiLiveRows.Size = New-Object System.Drawing.Size(756, 224)
 $uiLiveRows.BackColor = $theme.Panel
@@ -2076,6 +2125,10 @@ $form.AcceptButton = $uiStart
 $form.CancelButton = $uiCancel
 # Opening on a focused dropdown means a stray scroll changes the work folder.
 $form.Add_Shown({
+    # Build and paint the native child controls once while transparent. This
+    # avoids their temporary white system-theme rectangles on the first frame.
+    $form.Refresh()
+    $form.Opacity = 1
     $uiStart.Focus()
 })
 
