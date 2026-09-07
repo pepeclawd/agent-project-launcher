@@ -1260,10 +1260,11 @@ function Set-WindowIcon {
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = 'Start an agent session'
 $form.StartPosition   = 'CenterScreen'
-$form.FormBorderStyle = 'FixedDialog'
-$form.MaximizeBox     = $false
-$form.MinimizeBox     = $false
+$form.FormBorderStyle = 'Sizable'
+$form.MaximizeBox     = $true
+$form.MinimizeBox     = $true
 $form.ClientSize      = New-Object System.Drawing.Size(820, 504)
+$form.MinimumSize     = $form.Size
 $form.Font            = $fontBase
 $form.BackColor       = $theme.Bg
 $form.ForeColor       = $theme.Head
@@ -1789,8 +1790,10 @@ $edgeR  = 772
 $uiNewTab  = New-ThemeButton $form 'New session'   16 10 146 $theme.Section 1
 $uiLiveTab = New-ThemeButton $form 'Live sessions' 170 10 162 $theme.Label 1
 $uiBrandWordmark = New-RainbowWordmark $form 667 10
+$uiBrandWordmark.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
 
 $panel = New-ThemePanel $form 16 46 $panelW 444 -Bordered
+$panel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 
 # Paths and link lists are longer than the row they live on, so the row shows
 # what fits and hovering shows the whole thing. Drawn by hand, because a system
@@ -2013,8 +2016,10 @@ Set-RowTip $uiWeb $help.Web
 
 $livePanel = New-ThemePanel $form 16 46 $panelW 380 -Bordered
 $livePanel.Visible = $false
+$livePanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 [void](New-ThemeText $livePanel '# Live terminal sessions' $edgeL 16 $theme.Section 400)
 $uiLiveRefresh = New-ThemeButton $livePanel 'Refresh' 648 12 124 $theme.Head 1
+$uiLiveRefresh.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
 [void](New-ThemeText $livePanel 'Context health, account limits and launch permissions. Hover any value for details.' $edgeL 44 $theme.Muted 756)
 
 [void](New-ThemeText $livePanel 'Agent'   16 76 $theme.Label 64)
@@ -2032,8 +2037,10 @@ $uiLiveRows.Size = New-Object System.Drawing.Size(756, 224)
 $uiLiveRows.BackColor = $theme.Panel
 $uiLiveRows.Font = $fontBase
 $uiLiveRows.AutoScroll = $true
+$uiLiveRows.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $livePanel.Controls.Add($uiLiveRows)
 $uiLiveSummary = New-ThemeText $livePanel '' 16 342 $theme.Muted 620
+$uiLiveSummary.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
 
 $script:panelHeightCollapsed = 380
 $script:panelHeightExpanded  = $advanced.Top + $advanced.Height + 16
@@ -2054,11 +2061,16 @@ function Update-Layout {
     $buttonTop = $panel.Top + $panelHeight + 16
     $uiStart.Top = $buttonTop
     $uiCancel.Top = $buttonTop
-    $form.ClientSize = New-Object System.Drawing.Size($form.ClientSize.Width, ($buttonTop + 26 + 20))
+    $requiredHeight = $buttonTop + 26 + 20
+    if ($form.ClientSize.Height -lt $requiredHeight) {
+        $form.ClientSize = New-Object System.Drawing.Size($form.ClientSize.Width, $requiredHeight)
+    }
 }
 
 $uiStart  = New-ThemeButton $form 'Open terminal' 526 442 170 $theme.Section 1
 $uiCancel = New-ThemeButton $form 'Cancel' 704 442 100 $theme.Label 1
+$uiStart.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+$uiCancel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
 $uiCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 $form.AcceptButton = $uiStart
 $form.CancelButton = $uiCancel
@@ -2526,7 +2538,9 @@ function Refresh-LiveSessions {
             Set-RowTip $healthLabel 'OK below 60%; Watch from 60%; Compact from 80%.'
             $usageLabel = New-ThemeText $uiLiveRows $session.UsageDisplay 574 $y $theme.Head 90 $fontBase
             Set-RowTip $usageLabel $session.UsageDetail
-            $permissionLabel = New-ThemeText $uiLiveRows $session.Permission 668 $y $theme.Head 88 $fontBase
+            # Keep the right edge inside the viewport even when the vertical
+            # scrollbar is present; horizontal scrolling is never needed here.
+            $permissionLabel = New-ThemeText $uiLiveRows $session.Permission 668 $y $theme.Head 68 $fontBase
             Set-RowTip $permissionLabel ('Launch permission mode: ' + $session.Permission)
             $projectDetails = @()
             if ($session.Workspace) { $projectDetails += $session.Workspace }
@@ -2537,6 +2551,10 @@ function Refresh-LiveSessions {
             $rowIndex++
         }
     }
+    $contentHeight = [Math]::Max(0, 8 + ($script:liveSessions.Count * 30))
+    $uiLiveRows.AutoScrollMinSize = New-Object System.Drawing.Size(0, $contentHeight)
+    $uiLiveRows.HorizontalScroll.Enabled = $false
+    $uiLiveRows.HorizontalScroll.Visible = $false
     $uiLiveRows.ResumeLayout()
     $uiLiveSummary.Text = if ($script:liveSessions.Count -eq 1) { '1 live terminal session' } else {
         '{0} live terminal sessions' -f $script:liveSessions.Count
@@ -2564,7 +2582,10 @@ function Set-LauncherView {
         Refresh-LiveSessions -RefreshAccountUsage
         $buttonTop = $livePanel.Top + $livePanel.Height + 16
         $uiCancel.Top = $buttonTop
-        $form.ClientSize = New-Object System.Drawing.Size($form.ClientSize.Width, ($buttonTop + 26 + 20))
+        $requiredHeight = $buttonTop + 26 + 20
+        if ($form.ClientSize.Height -lt $requiredHeight) {
+            $form.ClientSize = New-Object System.Drawing.Size($form.ClientSize.Width, $requiredHeight)
+        }
         $form.AcceptButton = $uiLiveRefresh
         $uiLiveRefresh.Focus()
     } else {

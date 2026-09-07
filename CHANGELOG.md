@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1
+
+- Made the launcher window resizable and maximizable.
+- Added a minimum window size that keeps the Live sessions table readable.
+- Live sessions now use additional width and height when the window grows.
+- Removed the unnecessary horizontal scrollbar while retaining vertical scrolling.
+
 ## 1.0.0
 
 - Initial public release.
@@ -8,4 +15,3 @@
 - Live session overview with context health and locally available limits.
 - Configurable project and notes roots.
 - Windows installer, shortcuts and uninstaller.
-
