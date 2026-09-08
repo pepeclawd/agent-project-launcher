@@ -4,10 +4,12 @@ A small Windows launcher for starting and monitoring Claude Code and OpenAI Code
 
 ## Features
 
-- Start Claude Code or Codex in any project folder.
+- Start Claude Code or Codex in any folder on the machine, including a network share.
 - Choose model, permission level, network policy, opening prompt and extra writable folders.
 - Resume or pick an earlier session.
 - View live terminal sessions, active model, context health, limits when available, and permissions.
+- Click a live session to jump to its terminal tab with the caret in its prompt, or to compact it.
+- Compact every live session in one action.
 - Remember settings per project.
 - Optionally link a project to a notes folder through `AGENTS.md`.
 
@@ -32,7 +34,9 @@ If Windows blocks the script, open PowerShell in the extracted folder and run:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1
 ```
 
-The default folders are `Documents\Projects` and `Documents\Notes`. To choose others:
+The configured roots are `Documents\Projects` and `Documents\Notes`. They are a shorthand for
+the folder list and the picker, not a restriction: any folder on the machine can be a work
+folder, including a UNC share such as `\\server\share`. To choose different roots:
 
 ```powershell
 .\Install.ps1 -ProjectRoot 'D:\Code' -NotesRoot 'D:\Notes'
@@ -43,6 +47,12 @@ The installer writes application files to `%LOCALAPPDATA%\Programs\AgentProjectL
 ## Privacy and network behavior
 
 The launcher runs locally and does not collect analytics. It reads local process metadata and local Claude/Codex session transcripts to build the Live sessions overview; it does not read or display message content.
+
+Going to a session, or compacting one, brings its terminal tab to the front. Compacting then types
+`/compact` into that window as keystrokes, because a terminal CLI offers no other way in. The tab is
+located in a short-lived helper process, and a session whose tab cannot be identified with certainty
+is skipped rather than guessed at. Anything already typed but unsent in a session is sent along with
+the command, and moving the mouse or keyboard during a send can carry the keystrokes elsewhere.
 
 Claude account-limit fetching is intentionally disabled in this public build because Claude does not provide a supported public endpoint for it. Claude transcript context usage is still shown when available. Codex limits are read from local session metadata when available.
 

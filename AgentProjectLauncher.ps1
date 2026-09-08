@@ -30,9 +30,31 @@ try {
     Add-Type -TypeDefinition @'
 using System;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace Launcher {
+    // A ContextMenuStrip paints itself from ProfessionalColors, which stay
+    // light whatever the control's own BackColor says. Supplying the table is
+    // the only way to make a dropdown match the rest of the window.
+    public class DarkMenuColors : ProfessionalColorTable {
+        private readonly Color surface, edge, hover;
+        public DarkMenuColors(Color surface, Color edge, Color hover) {
+            this.surface = surface; this.edge = edge; this.hover = hover;
+        }
+        public override Color ToolStripDropDownBackground { get { return surface; } }
+        public override Color MenuItemSelected { get { return hover; } }
+        public override Color MenuItemSelectedGradientBegin { get { return hover; } }
+        public override Color MenuItemSelectedGradientEnd { get { return hover; } }
+        public override Color MenuItemBorder { get { return edge; } }
+        public override Color MenuBorder { get { return edge; } }
+        public override Color ImageMarginGradientBegin { get { return surface; } }
+        public override Color ImageMarginGradientMiddle { get { return surface; } }
+        public override Color ImageMarginGradientEnd { get { return surface; } }
+        public override Color SeparatorDark { get { return edge; } }
+        public override Color SeparatorLight { get { return edge; } }
+    }
+
     public class VerticalResizeForm : Form {
         private const int WM_NCHITTEST = 0x0084;
         private const int HTCLIENT = 1;
@@ -65,9 +87,46 @@ namespace Launcher {
                      ControlStyles.ResizeRedraw, true);
         }
     }
+
+    // Windows refuses SetForegroundWindow to a process that does not already
+    // own the foreground. Attaching to the current foreground thread's input
+    // queue for the duration of the call is the documented way around it, and
+    // it is what makes typing into another terminal land where it is aimed.
+    public static class WindowFocus {
+        [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(uint dwProcessId);
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);
+        [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint attachTo, bool doAttach);
+        [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+        private const int SW_RESTORE = 9;
+
+        public static bool Activate(IntPtr hWnd) {
+            if (hWnd == IntPtr.Zero) return false;
+            if (IsIconic(hWnd)) ShowWindow(hWnd, SW_RESTORE);
+            uint self = GetCurrentThreadId();
+            uint owner = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+            bool attached = (owner != 0 && owner != self && AttachThreadInput(self, owner, true));
+            try {
+                SetForegroundWindow(hWnd);
+            } finally {
+                if (attached) AttachThreadInput(self, owner, false);
+            }
+            return GetForegroundWindow() == hWnd;
+        }
+    }
 }
 '@ -ReferencedAssemblies System.Windows.Forms,System.Drawing -ErrorAction Stop
 } catch { }
+
+# The tab walk runs in a helper process (see Invoke-TabAgent), so the launcher
+# needs a copy of the interpreter to run it with.
+$script:powerShellExe = Join-Path $PSHOME 'powershell.exe'
+if (-not (Test-Path -LiteralPath $script:powerShellExe -PathType Leaf)) {
+    $script:powerShellExe = 'powershell.exe'
+}
 
 $documentsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
 if (-not $documentsRoot) { $documentsRoot = Join-Path $env:USERPROFILE 'Documents' }
@@ -93,18 +152,6 @@ $script:claudeAccountUsage = $null
 
 # ---------------------------------------------------------------- helpers ---
 
-function Test-IsAllowedWorkspace {
-    param([Parameter(Mandatory)][string]$Path)
-    $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
-    foreach ($root in @($vaultRoot, $codeProjectsRoot) | Where-Object { $_ }) {
-        $fullRoot = [System.IO.Path]::GetFullPath($root).TrimEnd('\')
-        if ($fullPath.Equals($fullRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-            $fullPath.StartsWith($fullRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-            return $true
-        }
-    }
-    return $false
-}
 
 function Test-SamePath {
     param([string]$Left, [string]$Right)
@@ -152,7 +199,7 @@ function Get-LauncherSettings {
         foreach ($name in $legacyHidden) {
             foreach ($root in @($codeProjectsRoot, $projectsRoot)) {
                 $candidate = Join-Path $root $name
-                if (Test-Path -LiteralPath $candidate -PathType Container) { (Resolve-Path -LiteralPath $candidate).Path }
+                if (Test-Path -LiteralPath $candidate -PathType Container) { (Resolve-Path -LiteralPath $candidate).ProviderPath }
             }
         }
     )
@@ -253,21 +300,20 @@ function Save-LauncherSettings {
 }
 
 function Resolve-WorkspacePath {
-    # -AllowAnywhere is for extra writable folders, which are not restricted to
-    # the two trees the way a work folder is. Bare names still resolve only
-    # inside them; anywhere else has to be given as a full path.
+    # A full path is taken as given, wherever it points - a second drive or a
+    # UNC share is a legitimate place to work. The configured roots are only a
+    # shorthand: a bare name is looked up inside them, and anything else has to
+    # be spelled out in full.
     param([Parameter(Mandatory)][string]$Value, [switch]$AllowAnywhere)
     if ($Value -in @('Notes', 'Notes (root)')) { return $vaultRoot }
     if ($Value -eq '.') { return $codeProjectsRoot }
     if ([System.IO.Path]::IsPathRooted($Value)) {
         if (-not (Test-Path -LiteralPath $Value -PathType Container)) { throw "Folder '$Value' does not exist." }
-        $resolved = (Resolve-Path -LiteralPath $Value).Path
-        if (-not $AllowAnywhere -and -not (Test-IsAllowedWorkspace $resolved)) { throw 'Choose a folder inside one of the configured roots.' }
-        return $resolved
+        return (Resolve-Path -LiteralPath $Value).ProviderPath
     }
     foreach ($root in @($codeProjectsRoot, $projectsRoot)) {
         $candidate = Join-Path $root $Value
-        if (Test-Path -LiteralPath $candidate -PathType Container) { return (Resolve-Path -LiteralPath $candidate).Path }
+        if (Test-Path -LiteralPath $candidate -PathType Container) { return (Resolve-Path -LiteralPath $candidate).ProviderPath }
     }
     $found = @(
         foreach ($root in @($projectsRoot, $codeProjectsRoot)) {
@@ -597,15 +643,19 @@ function Get-LaunchPreview {
         [string]$SelectedWeb = ''
     )
     if (-not $WorkingDirectory) { throw 'Choose a project folder.' }
-    $workPath = (Resolve-Path -LiteralPath $WorkingDirectory).Path
+    $workPath = (Resolve-Path -LiteralPath $WorkingDirectory).ProviderPath
     $contexts = @()
     foreach ($directory in $ContextDirectories) {
         if (-not $directory) { continue }
-        $resolved = (Resolve-Path -LiteralPath $directory).Path
+        $resolved = (Resolve-Path -LiteralPath $directory).ProviderPath
         if (Test-SamePath $resolved $workPath) { continue }
         if (-not (Test-PathInList $resolved $contexts)) { $contexts += $resolved }
     }
+    # A share root has no leaf, so '\\host\share' would name the session nothing
+    # at all and hand Claude an empty --name.
     $title = Split-Path -Leaf $workPath
+    if (-not $title) { $title = $workPath.Trim('\').Replace('\', '-') }
+    if (-not $title) { $title = 'workspace' }
     $spec  = Get-AgentSpec $SelectedAgent
     $model = Get-ModelSlug $SelectedModel
     $mode  = Get-ModeSlug $SelectedMode
@@ -753,7 +803,7 @@ function Get-ClaudeTranscriptModel {
             foreach ($root in @($codeProjectsRoot, $projectsRoot)) {
                 $candidate = Join-Path $root $Project
                 if (Test-Path -LiteralPath $candidate -PathType Container) {
-                    $workspacePath = (Resolve-Path -LiteralPath $candidate).Path
+                    $workspacePath = (Resolve-Path -LiteralPath $candidate).ProviderPath
                     break
                 }
             }
@@ -1650,6 +1700,36 @@ function Get-PickerSubdirectories {
 # Every ready fixed/removable drive, so a picker can reach the whole machine.
 # Labelled with the volume name because 'C:\' alone says nothing about which
 # disk it is once a Google Drive letter is in the same list.
+# '\\host\share' out of any path on that share. Anything shorter is not a
+# reachable folder, so a bare '\\host' is not offered.
+function Get-UncShareRoot {
+    param([string]$Path)
+    if (-not $Path -or -not $Path.StartsWith('\\')) { return '' }
+    $segments = @($Path.TrimStart('\') -split '\\' | Where-Object { $_ })
+    if ($segments.Count -lt 2) { return '' }
+    return '\\{0}\{1}' -f $segments[0], $segments[1]
+}
+
+# Shares the launcher already knows about: every work folder and scope folder
+# ever saved, plus wherever the picker was pointed at when it opened.
+function Get-KnownShareRoots {
+    param([string]$Extra = '')
+    $seen = @()
+    $sources = @($script:savedProjects) + @($Extra)
+    foreach ($map in @($script:projectContexts)) {
+        if ($map) { foreach ($key in @($map.Keys)) { $sources += @($map[$key]) } }
+    }
+    foreach ($candidate in $sources) {
+        $share = Get-UncShareRoot ([string]$candidate)
+        if (-not $share) { continue }
+        if ($seen -contains $share) { continue }
+        $reachable = $false
+        try { $reachable = Test-Path -LiteralPath $share -PathType Container } catch { }
+        if ($reachable) { $seen += $share }
+    }
+    return @($seen)
+}
+
 function Get-PickerDriveRoots {
     $roots = @()
     foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
@@ -1714,13 +1794,21 @@ function Show-FolderPicker {
 
     $tree = New-Object System.Windows.Forms.TreeView
     $tree.Location = New-Object System.Drawing.Point(16, 44)
-    $tree.Size = New-Object System.Drawing.Size(468, 316)
+    $tree.Size = New-Object System.Drawing.Size(468, 296)
     $tree.HideSelection = $false
     $tree.BorderStyle = 'FixedSingle'
     $tree.BackColor = $theme.Panel
     $tree.ForeColor = $theme.Value
     $tree.LineColor = $theme.Border
     $dialog.Controls.Add($tree)
+
+    # A share is not a drive, so it can never appear in the tree on its own. The
+    # box below is the way in, and unlabelled it reads as a display of what was
+    # clicked rather than something to type in.
+    $boxHint = if ($AllowAnywhere) {
+        'Folder  -  pick above, or type e.g. \\server\share'
+    } else { 'Folder' }
+    [void](New-ThemeText $dialog $boxHint 16 348 $theme.Label 468)
 
     # Read-only unless anywhere is allowed, so a typed path cannot slip past the
     # roots in the pickers that are deliberately fenced.
@@ -1750,13 +1838,20 @@ function Show-FolderPicker {
     $rootEntries = @()
     foreach ($root in $Roots) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
-        $resolvedRoot = (Resolve-Path -LiteralPath $root).Path
+        $resolvedRoot = (Resolve-Path -LiteralPath $root).ProviderPath
         $rootEntries += [pscustomobject]@{ Path = $resolvedRoot; Label = (Split-Path -Leaf $resolvedRoot) }
     }
     if ($AllowAnywhere) {
         foreach ($drive in @(Get-PickerDriveRoots)) {
             if (Test-PathInList $drive.Path @($rootEntries | ForEach-Object { $_.Path })) { continue }
             $rootEntries += $drive
+        }
+        # A share has no drive letter to be found under, so it would stay
+        # invisible however long you browsed. Any share already in use gets its
+        # own root here, which is what makes it browsable the second time.
+        foreach ($share in @(Get-KnownShareRoots -Extra $Initial)) {
+            if (Test-PathInList $share @($rootEntries | ForEach-Object { $_.Path })) { continue }
+            $rootEntries += [pscustomobject]@{ Path = $share; Label = $share }
         }
     }
     foreach ($entry in $rootEntries) { Add-PickerNode $tree.Nodes $entry.Label $entry.Path }
@@ -1772,6 +1867,18 @@ function Show-FolderPicker {
         # An unfinished path can contain characters Test-Path refuses outright.
         try { $exists = [bool]$candidate -and (Test-Path -LiteralPath $candidate -PathType Container) } catch { $exists = $false }
         $chooseButton.Enabled = $exists
+        # Typing a share once puts it in the tree straight away, so the rest of
+        # the way down can be clicked instead of spelled out.
+        if ($exists -and $AllowAnywhere) {
+            $share = Get-UncShareRoot $candidate
+            if ($share) {
+                $present = $false
+                foreach ($rootNode in $tree.Nodes) {
+                    if (Test-SamePath ([string]$rootNode.Tag) $share) { $present = $true; break }
+                }
+                if (-not $present) { Add-PickerNode $tree.Nodes $share $share }
+            }
+        }
     })
     $tree.Add_NodeMouseDoubleClick({ if ($chooseButton.Enabled) { $chooseButton.PerformClick() } })
 
@@ -1799,7 +1906,7 @@ function Show-FolderPicker {
     if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return '' }
     $chosen = $chosenBox.Text.Trim().Trim('"')
     if (-not $chosen) { return '' }
-    try { return (Resolve-Path -LiteralPath $chosen).Path } catch { return '' }
+    try { return (Resolve-Path -LiteralPath $chosen).ProviderPath } catch { return '' }
 }
 
 # A question with more than two answers, in the window's own colours. Returns
@@ -2096,9 +2203,21 @@ $livePanel = New-ThemePanel $form 16 46 $panelW 380 -Bordered
 $livePanel.Visible = $false
 $livePanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 [void](New-ThemeText $livePanel '# Live terminal sessions' $edgeL 16 $theme.Section 400)
+$uiLiveCompact = New-ThemeButton $livePanel 'Compact all' 494 12 146 $theme.Head 1
+$uiLiveCompact.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+Set-RowTip $uiLiveCompact (@(
+    'Types /compact into every session in the list, one at a time.',
+    '',
+    'There is no other way in: both CLIs are terminal programs, so the launcher',
+    'brings each tab to the front and sends the keystrokes. Leave the mouse and',
+    'keyboard alone while it runs.',
+    '',
+    'A session whose tab cannot be identified with certainty is skipped rather',
+    'than guessed at, and named in the summary.'
+) -join "`r`n")
 $uiLiveRefresh = New-ThemeButton $livePanel 'Refresh' 648 12 124 $theme.Head 1
 $uiLiveRefresh.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
-[void](New-ThemeText $livePanel 'Context usage, account limits and launch permissions. Hover any value for details.' $edgeL 44 $theme.Muted 756)
+[void](New-ThemeText $livePanel 'Context usage, limits and permissions. Hover for detail, click a session for its actions.' $edgeL 44 $theme.Muted 756)
 
 # Context carries its own health: green below 60%, amber from 60%, red from 80%.
 # A separate column only restated what the colour already says.
@@ -2199,6 +2318,10 @@ $uiAdvancedToggle.Add_Click({
 $uiNewTab.Add_Click({ Set-LauncherView 'new' })
 $uiLiveTab.Add_Click({ Set-LauncherView 'live' })
 $uiLiveRefresh.Add_Click({ Refresh-LiveSessions -RefreshAccountUsage })
+$uiLiveCompact.Add_Click({
+    if (-not [bool]$uiLiveCompact.Tag) { return }
+    Invoke-CompactAllSessions
+})
 
 # ------------------------------------------------------------------ state ---
 
@@ -2263,10 +2386,26 @@ function Build-ProjectRows {
     }
     foreach ($saved in $script:savedProjects) {
         if (-not (Test-Path -LiteralPath $saved -PathType Container)) { continue }
-        $resolved = (Resolve-Path -LiteralPath $saved).Path
+        $resolved = (Resolve-Path -LiteralPath $saved).ProviderPath
         $candidates += [pscustomobject]@{ Display = (Split-Path -Leaf $resolved); Path = $resolved }
     }
-    return Select-VisibleRows -Candidates $candidates -Hidden $script:hiddenProjects
+    $rows = @(Select-VisibleRows -Candidates $candidates -Hidden $script:hiddenProjects)
+
+    # A folder picked from anywhere on the machine can share its name with one
+    # under the roots - a share called hurlumhej and a local clone of the same
+    # name. Two identical lines in the list would be a coin toss, so a repeated
+    # name carries the folder above it.
+    $nameCounts = @{}
+    foreach ($row in $rows) {
+        $key = $row.Display.ToLowerInvariant()
+        $nameCounts[$key] = 1 + [int]$nameCounts[$key]
+    }
+    foreach ($row in $rows) {
+        if ($nameCounts[$row.Display.ToLowerInvariant()] -le 1) { continue }
+        $parent = Split-Path -Parent $row.Path
+        if ($parent) { $row.Display = '{0}  -  {1}' -f $row.Display, $parent }
+    }
+    return $rows
 }
 
 function Get-AttachedContextPaths {
@@ -2284,7 +2423,7 @@ function Set-AttachedContextPaths {
     foreach ($path in $Paths) {
         if (-not $path) { continue }
         if (-not (Test-Path -LiteralPath $path -PathType Container)) { continue }
-        $resolved = (Resolve-Path -LiteralPath $path).Path
+        $resolved = (Resolve-Path -LiteralPath $path).ProviderPath
         if (-not (Test-PathInList $resolved $kept)) { $kept += $resolved }
     }
     $script:contextPaths = @($kept)
@@ -2443,126 +2582,444 @@ function Test-LiveSessionProject {
     return $Session.Project -eq (Split-Path -Leaf $ProjectPath)
 }
 
-function Select-WindowsTerminalTab {
-    param([Parameter(Mandatory)]$Session)
+# Every agent session is a tab inside one Windows Terminal window, so reaching a
+# particular session means walking the UI Automation tree. That walk cannot run
+# here. The first call into UIAutomationCore makes the calling process
+# DPI-aware, and Windows then stops scaling this window for the display. The
+# layout is hardcoded pixels written for a DPI-unaware process, so on a scaled
+# display the window collapses - at 150% to two thirds of its size - with every
+# glyph still drawn full size, and the columns and buttons cut their own text
+# off. Nothing takes it back either: a window keeps the awareness it was created
+# with. So the tab walk, the focus change and the keystrokes all run in a
+# separate PowerShell process, which is free to become DPI-aware because it
+# never shows a window.
+$script:tabAgentScript = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-    $script:lastTabSelectionAmbiguous = $false
-    try {
-        $condition = New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::TabItem
-        )
-        $tabs = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            $condition
-        )
-        $matches = @()
-        for ($index = 0; $index -lt $tabs.Count; $index++) {
-            $tab = $tabs.Item($index)
-            $name = [string]$tab.Current.Name
-            if (-not $name) { continue }
-
-            $score = 0
-            if ($Session.WindowTitle -and $name.Equals([string]$Session.WindowTitle, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $score += 200
-            } elseif ($Session.WindowTitle -and $name.IndexOf([string]$Session.WindowTitle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                $score += 100
-            }
-            if ($Session.Project -and $name.IndexOf([string]$Session.Project, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                $score += 40
-            }
-            $looksClaude = ($name -match '(?i)Claude|[✳✻✢]')
-            $looksCodex = ($name -match '(?i)Codex|>_')
-            if ($Session.Agent -eq 'Codex') {
-                if ($looksCodex) { $score += 300 }
-                if ($looksClaude) { $score -= 500 }
-            } else {
-                if ($looksClaude) { $score += 300 }
-                if ($looksCodex) { $score -= 500 }
-            }
-            if ($score -gt 0) { $matches += [pscustomobject]@{ Element = $tab; Score = $score } }
-        }
-        $best = $matches | Sort-Object Score -Descending | Select-Object -First 1
-        if (-not $best) { return $false }
-        $sameScore = @($matches | Where-Object { $_.Score -eq $best.Score })
-        if ($sameScore.Count -gt 1) {
-            # Two indistinguishable tabs are not safe to guess between. New
-            # Codex sessions have a >_ prefix, which removes this ambiguity.
-            $script:lastTabSelectionAmbiguous = $true
-            return $false
-        }
-
-        # Stop at the Windows Terminal window. The previous version kept
-        # walking through it to the desktop root, so the right tab could be
-        # selected without its terminal ever receiving keyboard focus.
-        $owner = $best.Element
-        while ($owner -and $owner.Current.ControlType -ne [System.Windows.Automation.ControlType]::Window) {
-            $owner = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($owner)
-        }
-        if (-not $owner) { return $false }
-
-        $pattern = $null
-        $selected = $false
-        if ($best.Element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
-            ([System.Windows.Automation.SelectionItemPattern]$pattern).Select()
-            $selected = $true
-        } elseif ($best.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
-            ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
-            $selected = $true
-        }
-        if (-not $selected) { return $false }
-
-        Start-Sleep -Milliseconds 60
-        $windowHandle = [System.IntPtr]$owner.Current.NativeWindowHandle
-        if ($windowHandle -ne [System.IntPtr]::Zero) {
-            [void][Launcher.WindowFocus]::SetForegroundWindow($windowHandle)
-        }
-
-        # Selecting a tab does not imply keyboard focus. Find the visible
-        # terminal control inside that window and focus it so typing can begin
-        # immediately without an extra click.
-        $focusCondition = New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty,
-            $true
-        )
-        $focusable = $owner.FindAll([System.Windows.Automation.TreeScope]::Descendants, $focusCondition)
-        $focusMatches = @()
-        for ($focusIndex = 0; $focusIndex -lt $focusable.Count; $focusIndex++) {
-            $element = $focusable.Item($focusIndex)
-            if ($element.Current.IsOffscreen -or -not $element.Current.IsEnabled) { continue }
-            $type = $element.Current.ControlType
-            if ($type -eq [System.Windows.Automation.ControlType]::TabItem -or
-                $type -eq [System.Windows.Automation.ControlType]::Button) { continue }
-
-            $focusScore = 0
-            $identity = ([string]$element.Current.AutomationId) + ' ' + ([string]$element.Current.ClassName)
-            if ($identity -match '(?i)Terminal|TermControl') { $focusScore += 200 }
-            if ($type -eq [System.Windows.Automation.ControlType]::Document) { $focusScore += 100 }
-            if ($type -eq [System.Windows.Automation.ControlType]::Text) { $focusScore += 80 }
-            if ($type -eq [System.Windows.Automation.ControlType]::Pane -or
-                $type -eq [System.Windows.Automation.ControlType]::Custom) { $focusScore += 40 }
-            if ($focusScore -gt 0) {
-                $focusMatches += [pscustomobject]@{ Element = $element; Score = $focusScore }
-            }
-        }
-        $focusTarget = $focusMatches | Sort-Object Score -Descending | Select-Object -First 1
-        if ($focusTarget) {
-            try { $focusTarget.Element.SetFocus() } catch { }
-        }
-
-        # The tab was found and selected. SetForegroundWindow may legally
-        # return false even when Windows completed the switch, so do not turn
-        # that into a misleading "terminal not found" error.
-        return $true
-    } catch { }
-    return $false
+# One word on stdout is the whole protocol. The caller reads the last non-empty
+# line, so anything a module or a warning prints on the way cannot be mistaken
+# for the answer.
+function Write-Status {
+    param([string]$Value)
+    [Console]::Out.WriteLine($Value)
+    exit 0
 }
+
+$sessionTitle   = [string]$env:TABAGENT_TITLE
+$sessionProject = [string]$env:TABAGENT_PROJECT
+$sessionAgent   = [string]$env:TABAGENT_AGENT
+$command        = [string]$env:TABAGENT_COMMAND
+
+try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+    Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
+} catch { Write-Status 'failed' }
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class TabFocus {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint attachTo, bool doAttach);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    private const int SW_RESTORE = 9;
+    public static bool Activate(IntPtr hWnd) {
+        if (hWnd == IntPtr.Zero) return false;
+        if (IsIconic(hWnd)) ShowWindow(hWnd, SW_RESTORE);
+        uint self = GetCurrentThreadId();
+        uint owner = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        bool attached = (owner != 0 && owner != self && AttachThreadInput(self, owner, true));
+        try { SetForegroundWindow(hWnd); }
+        finally { if (attached) AttachThreadInput(self, owner, false); }
+        return GetForegroundWindow() == hWnd;
+    }
+}
+"@
+
+# The desktop's tab controls are not only Windows Terminal's: a browser and File
+# Explorer expose theirs too, and a Chrome tab is quite capable of being called
+# 'HelleK' at the same moment a session is. Anything typed at a wrongly chosen
+# tab goes into someone else's window, so only tabs belonging to a terminal host
+# process are eligible.
+$hostNames = @{}
+function Test-TerminalHostWindow {
+    param($Element)
+    if (-not $Element) { return $false }
+    $processId = [int]$Element.Current.ProcessId
+    if (-not $hostNames.ContainsKey($processId)) {
+        $name = ''
+        try { $name = (Get-Process -Id $processId -ErrorAction Stop).ProcessName } catch { }
+        $hostNames[$processId] = $name
+    }
+    return ([string]$hostNames[$processId] -match '(?i)^(WindowsTerminal|OpenConsole|conhost|powershell|pwsh)$')
+}
+
+function Get-TabOwnerWindow {
+    param($Element)
+    $owner = $Element
+    while ($owner -and $owner.Current.ControlType -ne [System.Windows.Automation.ControlType]::Window) {
+        $owner = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($owner)
+    }
+    return $owner
+}
+
+$ambiguous = $false
+
+function Select-SessionTab {
+    $condition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::TabItem
+    )
+    $tabs = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        $condition
+    )
+    # Not $matches: that is PowerShell's automatic capture-group variable, and
+    # the -match tests below overwrite it with a hashtable mid-loop.
+    $candidates = @()
+    for ($index = 0; $index -lt $tabs.Count; $index++) {
+        $tab = $tabs.Item($index)
+        $name = [string]$tab.Current.Name
+        if (-not $name) { continue }
+        $owner = Get-TabOwnerWindow $tab
+        if (-not $owner) { continue }
+        if (-not (Test-TerminalHostWindow $owner)) { continue }
+
+        # The tab has to name this session before anything else counts.
+        # Rewarding an agent marker on its own scored every Claude tab the same,
+        # and a pile of equal scores reads as "cannot tell them apart".
+        $identity = 0
+        if ($sessionTitle -and $name.Equals($sessionTitle, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $identity += 200
+        } elseif ($sessionTitle -and $name.IndexOf($sessionTitle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $identity += 100
+        }
+        if ($sessionProject -and $name.IndexOf($sessionProject, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $identity += 40
+        }
+        if ($identity -le 0) { continue }
+
+        # An agent marker now only separates two tabs that both name the
+        # session, and the wrong agent's marker rules a tab out.
+        $score = $identity
+            $looksClaude = ($name -match '(?i)Claude|[✳✻✢]')
+        $looksCodex = ($name -match '(?i)Codex|>_')
+        if ($sessionAgent -eq 'Codex') {
+            if ($looksCodex) { $score += 300 }
+            if ($looksClaude) { $score -= 500 }
+        } else {
+            if ($looksClaude) { $score += 300 }
+            if ($looksCodex) { $score -= 500 }
+        }
+        if ($score -gt 0) {
+            $candidates += [pscustomobject]@{ Element = $tab; Owner = $owner; Score = $score }
+        }
+    }
+    $best = $candidates | Sort-Object Score -Descending | Select-Object -First 1
+    if (-not $best) { return [System.IntPtr]::Zero }
+    $sameScore = @($candidates | Where-Object { $_.Score -eq $best.Score })
+    if ($sameScore.Count -gt 1) {
+        # Two indistinguishable tabs are not safe to guess between. New Codex
+        # sessions have a >_ prefix, which removes this ambiguity.
+        $script:ambiguous = $true
+        return [System.IntPtr]::Zero
+    }
+
+    # Stop at the Windows Terminal window. Walking on through it to the desktop
+    # root let the right tab be selected without its terminal ever receiving
+    # keyboard focus.
+    $owner = $best.Owner
+    if (-not $owner) { return [System.IntPtr]::Zero }
+
+    $pattern = $null
+    $selected = $false
+    if ($best.Element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
+        ([System.Windows.Automation.SelectionItemPattern]$pattern).Select()
+        $selected = $true
+    } elseif ($best.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+        ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+        $selected = $true
+    }
+    if (-not $selected) { return [System.IntPtr]::Zero }
+
+    Start-Sleep -Milliseconds 60
+    $windowHandle = [System.IntPtr]$owner.Current.NativeWindowHandle
+    if ($windowHandle -eq [System.IntPtr]::Zero) { return [System.IntPtr]::Zero }
+    [void][TabFocus]::Activate($windowHandle)
+
+    # Selecting a tab does not imply keyboard focus. Find the visible terminal
+    # control inside that window and focus it so typing can begin immediately
+    # without an extra click.
+    $focusCondition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty,
+        $true
+    )
+    $focusable = $owner.FindAll([System.Windows.Automation.TreeScope]::Descendants, $focusCondition)
+    $focusMatches = @()
+    for ($focusIndex = 0; $focusIndex -lt $focusable.Count; $focusIndex++) {
+        $element = $focusable.Item($focusIndex)
+        if ($element.Current.IsOffscreen -or -not $element.Current.IsEnabled) { continue }
+        $type = $element.Current.ControlType
+        if ($type -eq [System.Windows.Automation.ControlType]::TabItem -or
+            $type -eq [System.Windows.Automation.ControlType]::Button) { continue }
+
+        $focusScore = 0
+        $identity = ([string]$element.Current.AutomationId) + ' ' + ([string]$element.Current.ClassName)
+        if ($identity -match '(?i)Terminal|TermControl') { $focusScore += 200 }
+        if ($type -eq [System.Windows.Automation.ControlType]::Document) { $focusScore += 100 }
+        if ($type -eq [System.Windows.Automation.ControlType]::Text) { $focusScore += 80 }
+        if ($type -eq [System.Windows.Automation.ControlType]::Pane -or
+            $type -eq [System.Windows.Automation.ControlType]::Custom) { $focusScore += 40 }
+        if ($focusScore -gt 0) {
+            $focusMatches += [pscustomobject]@{ Element = $element; Score = $focusScore }
+        }
+    }
+    $focusTarget = $focusMatches | Sort-Object Score -Descending | Select-Object -First 1
+    if ($focusTarget) {
+        try { $focusTarget.Element.SetFocus() } catch { }
+    }
+    return $windowHandle
+}
+
+$windowHandle = [System.IntPtr]::Zero
+try { $windowHandle = Select-SessionTab } catch { $windowHandle = [System.IntPtr]::Zero }
+if ($windowHandle -eq [System.IntPtr]::Zero) {
+    if ($ambiguous) { Write-Status 'ambiguous' }
+    Write-Status 'notfound'
+}
+# No command means the caller only wanted the tab brought to the front.
+if (-not $command) { Write-Status 'shown' }
+
+[void][TabFocus]::Activate($windowHandle)
+# Windows hands the foreground over asynchronously.
+$deadline = [datetime]::UtcNow.AddMilliseconds(1500)
+while ([datetime]::UtcNow -lt $deadline) {
+    if ([TabFocus]::GetForegroundWindow() -eq $windowHandle) { break }
+    Start-Sleep -Milliseconds 50
+}
+if ([TabFocus]::GetForegroundWindow() -ne $windowHandle) { Write-Status 'focus' }
+
+try {
+    [System.Windows.Forms.SendKeys]::SendWait($command)
+    # The slash-command palette needs a moment to filter down to the typed
+    # command before Enter chooses it. Touching the keyboard or the mouse during
+    # that pause moves the foreground, and the rest of the keystrokes follow it
+    # into whatever window arrived, so check again before pressing Enter and
+    # leave the line unsent rather than send it somewhere else.
+    Start-Sleep -Milliseconds 250
+    if ([TabFocus]::GetForegroundWindow() -ne $windowHandle) { Write-Status 'moved' }
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    Start-Sleep -Milliseconds 150
+} catch {
+    Write-Status 'failed'
+}
+Write-Status 'sent'
+'@
+
+$script:tabAgentPath = $null
+function Get-TabAgentPath {
+    if ($script:tabAgentPath -and (Test-Path -LiteralPath $script:tabAgentPath -PathType Leaf)) {
+        return $script:tabAgentPath
+    }
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ('agent-launcher-tab-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    Set-Content -LiteralPath $path -Value $script:tabAgentScript -Encoding UTF8
+    $script:tabAgentPath = $path
+    return $path
+}
+
+function Remove-TabAgentScript {
+    if ($script:tabAgentPath -and (Test-Path -LiteralPath $script:tabAgentPath -PathType Leaf)) {
+        try { Remove-Item -LiteralPath $script:tabAgentPath -Force -ErrorAction Stop } catch { }
+    }
+    $script:tabAgentPath = $null
+}
+
+# Returns one of: shown, sent, ambiguous, notfound, focus, moved, failed.
+function Invoke-TabAgent {
+    param([Parameter(Mandatory)]$Session, [string]$Command = '')
+
+    $path = $null
+    try { $path = Get-TabAgentPath } catch { return 'failed' }
+
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $script:powerShellExe
+    # MTA, not STA. A UI Automation client asks other processes for their trees
+    # over COM, and on a single-threaded apartment the reply has to come back
+    # through a message pump this helper does not have, so the first sweep never
+    # returns. On a multi-threaded apartment the call completes on its own.
+    $info.Arguments = '-NoProfile -NonInteractive -MTA -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $path
+    $info.UseShellExecute = $false
+    $info.RedirectStandardOutput = $true
+    $info.CreateNoWindow = $true
+    # The session details travel in the environment. A window title is free text
+    # and would otherwise have to survive two rounds of command line quoting.
+    $info.EnvironmentVariables['TABAGENT_TITLE'] = [string]$Session.WindowTitle
+    $info.EnvironmentVariables['TABAGENT_PROJECT'] = [string]$Session.Project
+    $info.EnvironmentVariables['TABAGENT_AGENT'] = [string]$Session.Agent
+    $info.EnvironmentVariables['TABAGENT_COMMAND'] = $Command
+
+    $process = $null
+    try {
+        $process = [System.Diagnostics.Process]::Start($info)
+        # Only a process that already owns the foreground may hand it on. The
+        # helper has no window of its own, so without this it cannot bring the
+        # terminal forward.
+        try { [void][Launcher.WindowFocus]::AllowSetForegroundWindow([uint32]$process.Id) } catch { }
+        # Read on a task, not inline: a synchronous read of a helper that never
+        # answers blocks the launcher's own message loop, and the whole window
+        # freezes with no way back. The wait below is what bounds this.
+        $reader = $process.StandardOutput.ReadToEndAsync()
+        if (-not $process.WaitForExit(20000)) {
+            try { $process.Kill() } catch { }
+            return 'failed'
+        }
+        $output = if ($reader.Wait(2000)) { [string]$reader.Result } else { '' }
+        $status = @($output -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -Last 1
+        if (-not $status) { return 'failed' }
+        return $status.Trim()
+    } catch {
+        return 'failed'
+    } finally {
+        if ($process) { try { $process.Dispose() } catch { } }
+    }
+}
+
+# Typing at a session means becoming its foreground window and sending
+# keystrokes; the agents expose no other way in. That is only safe while the
+# window actually in front is the one that was aimed at, so the send is gated on
+# re-reading the foreground rather than on having asked for it.
+function Send-SessionCommand {
+    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][string]$Command)
+    return (Invoke-TabAgent -Session $Session -Command $Command)
+}
+
+# One wording for a failed hand-off, so the row menu and Compact all cannot
+# drift apart.
+function Get-TabAgentReason {
+    param([string]$Status)
+    switch ($Status) {
+        'ambiguous' { 'two tabs look identical' }
+        'notfound'  { 'tab not found' }
+        'focus'     { 'window would not come forward' }
+        'moved'     { 'focus moved away mid-command, left unsent' }
+        default     { 'the tab helper did not answer' }
+    }
+}
+
+function Get-SessionName {
+    param($Session)
+    if ($Session.Project) { return [string]$Session.Project }
+    return '(unknown)'
+}
+
+# Clicking a row opens this. Going to a session types nothing at all: the tab is
+# selected and the caret put in its prompt, which is the whole of what is needed
+# to carry on typing there by hand. Only the second item sends keystrokes.
+$script:menuSession = $null
+$script:sessionMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$script:sessionMenu.Font = $fontBase
+$script:sessionMenu.ShowImageMargin = $false
+$script:sessionMenu.BackColor = $theme.Field
+$script:sessionMenu.ForeColor = $theme.Head
+$menuColors = New-Object Launcher.DarkMenuColors($theme.Field, $theme.Border, $theme.Border)
+$script:sessionMenu.Renderer = New-Object System.Windows.Forms.ToolStripProfessionalRenderer($menuColors)
+
+$script:menuHeader = $script:sessionMenu.Items.Add('session')
+$script:menuHeader.Enabled = $false
+[void]$script:sessionMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+$script:menuGo = $script:sessionMenu.Items.Add('Go to this session')
+$script:menuGo.ForeColor = $theme.Head
+$script:menuCompact = $script:sessionMenu.Items.Add('Compact this session')
+$script:menuCompact.ForeColor = $theme.Head
+
+function Show-SessionMenu {
+    param([Parameter(Mandatory)]$Session)
+    $script:menuSession = $Session
+    $script:menuHeader.Text = '{0}  {1}' -f $Session.Agent, (Get-SessionName $Session)
+    $script:sessionMenu.Show([System.Windows.Forms.Cursor]::Position)
+}
+
+# The labels cover their row, so each one carries the row's handlers too and the
+# sender is either the row or a label sitting on it.
+function Get-RowPanel {
+    param($Control)
+    if ($Control -is [System.Windows.Forms.Label]) { return $Control.Parent }
+    return $Control
+}
+
+# One set of handlers for every row, written here rather than built per row in
+# the loop. A scriptblock closed over the loop with GetNewClosure is bound to a
+# module of its own, from which neither $theme nor this script's functions are
+# visible, so it throws where it stands and the row simply never lights up.
+$script:rowEnter = {
+    $row = Get-RowPanel $this
+    if ($row) {
+        $row.BackColor = $theme.Field
+        $row.Invalidate($true)
+    }
+}
+$script:rowLeave = {
+    $row = Get-RowPanel $this
+    if (-not $row) { return }
+    # Moving from the row onto one of its own labels raises MouseLeave without
+    # the pointer having left the row, so ask where it actually is.
+    $where = $row.PointToClient([System.Windows.Forms.Cursor]::Position)
+    if (-not $row.ClientRectangle.Contains($where)) {
+        $row.BackColor = $theme.Panel
+        $row.Invalidate($true)
+    }
+}
+$script:rowClick = {
+    $row = Get-RowPanel $this
+    if ($row -and $row.Tag) { Show-SessionMenu -Session $row.Tag }
+}
+
+$script:menuGo.Add_Click({
+    $session = $script:menuSession
+    if (-not $session) { return }
+    $name = Get-SessionName $session
+    $uiLiveSummary.Text = 'Bringing {0} to the front...' -f $name
+    [System.Windows.Forms.Application]::DoEvents()
+    $status = Invoke-TabAgent -Session $session
+    if ($status -eq 'shown') {
+        $uiLiveSummary.Text = '{0} is in front with the caret in its prompt.' -f $name
+    } else {
+        [void][Launcher.WindowFocus]::Activate($form.Handle)
+        $uiLiveSummary.Text = 'Could not reach {0}: {1}.' -f $name, (Get-TabAgentReason $status)
+    }
+})
+
+$script:menuCompact.Add_Click({
+    $session = $script:menuSession
+    if (-not $session) { return }
+    $name = Get-SessionName $session
+    $uiLiveSummary.Text = 'Typing /compact into {0}...' -f $name
+    [System.Windows.Forms.Application]::DoEvents()
+    $status = Send-SessionCommand -Session $session -Command '/compact'
+    $sent = ($status -eq 'sent')
+    # A session that took the command stays in front so the compaction can be
+    # watched. Come back here only to report one that did not.
+    if (-not $sent) { [void][Launcher.WindowFocus]::Activate($form.Handle) }
+    Refresh-LiveSessions
+    $uiLiveSummary.Text = if ($sent) {
+        'Sent /compact to {0}.' -f $name
+    } else {
+        '{0} was left untouched: {1}.' -f $name, (Get-TabAgentReason $status)
+    }
+})
 
 function Show-LiveSessionTerminal {
     param([Parameter(Mandatory)]$Session)
 
-    $activated = Select-WindowsTerminalTab -Session $Session
-    if (-not $activated -and $script:lastTabSelectionAmbiguous) {
+    $status = Invoke-TabAgent -Session $Session
+    $activated = ($status -eq 'shown')
+    if (-not $activated -and $status -eq 'ambiguous') {
         [void][System.Windows.Forms.MessageBox]::Show(
             $form,
             'Two terminal tabs look identical, so the launcher will not guess. Restart the older Codex session once to give its tab the new >_ marker.',
@@ -2575,7 +3032,7 @@ function Show-LiveSessionTerminal {
     try {
         $terminalProcess = Get-Process -Id ([int]$Session.TerminalId) -ErrorAction Stop
         if (-not $activated -and $terminalProcess.MainWindowHandle -ne [System.IntPtr]::Zero) {
-            $activated = [Launcher.WindowFocus]::SetForegroundWindow($terminalProcess.MainWindowHandle)
+            $activated = [Launcher.WindowFocus]::Activate($terminalProcess.MainWindowHandle)
         }
     } catch { }
 
@@ -2629,12 +3086,27 @@ function Refresh-LiveSessions {
         [void](New-ThemeText $uiLiveRows 'No live terminal sessions.' 0 8 $theme.Muted 500 $fontBase)
     } else {
         $rowIndex = 0
+        # Always leave room for the vertical scrollbar. A row sized to the full
+        # client width would overflow the moment the list grows enough to need
+        # one, and the panel would try to scroll sideways.
+        $rowWidth = [Math]::Max(0, $uiLiveRows.ClientSize.Width -
+            [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth)
         foreach ($session in $script:liveSessions) {
-            $y = 4 + ($rowIndex * 30)
-            $agentLabel = New-ThemeText $uiLiveRows $session.Agent 0 $y $theme.Head 64 $fontBase
+            # A panel per row, so the whole line is one click target and can
+            # light up under the pointer. The labels sit inside it.
+            $row = New-Object Launcher.BufferedPanel
+            $row.Location = New-Object System.Drawing.Point(0, ($rowIndex * 30))
+            $row.Size = New-Object System.Drawing.Size($rowWidth, 28)
+            $row.BackColor = $theme.Panel
+            $row.Cursor = [System.Windows.Forms.Cursors]::Hand
+            $row.Tag = $session
+            $uiLiveRows.Controls.Add($row)
+
+            $y = 4
+            $agentLabel = New-ThemeText $row $session.Agent 0 $y $theme.Head 64 $fontBase
             $projectText = if ($session.Project) { $session.Project } else { '(unknown)' }
-            $projectLabel = New-ThemeText $uiLiveRows $projectText 78 $y $theme.Head 200 $fontBase
-            $modelLabel = New-ThemeText $uiLiveRows $session.Model 288 $y $theme.Value 125 $fontBase
+            $projectLabel = New-ThemeText $row $projectText 78 $y $theme.Head 200 $fontBase
+            $modelLabel = New-ThemeText $row $session.Model 288 $y $theme.Value 125 $fontBase
             Set-RowTip $modelLabel ('{0} ({1})' -f $session.ModelDetail, $session.ModelSource)
             # The health reading is the colour of the number now, not a word in a
             # column of its own.
@@ -2644,7 +3116,7 @@ function Refresh-LiveSessions {
                 'OK'      { $theme.Value }
                 default   { $theme.Muted }
             }
-            $contextLabel = New-ThemeText $uiLiveRows $session.ContextDisplay 416 $y $contextColor 115 $fontBase
+            $contextLabel = New-ThemeText $row $session.ContextDisplay 416 $y $contextColor 115 $fontBase
             $contextTip = if ($session.ContextTokens -gt 0 -and $session.ContextWindow -gt 0) {
                 '{0:N0} of {1:N0} tokens currently used.{2}{2}Green below 60%, amber from 60%, red from 80%.' -f
                     $session.ContextTokens, $session.ContextWindow, "`r`n"
@@ -2652,17 +3124,26 @@ function Refresh-LiveSessions {
                 '{0:N0} tokens currently used. Claude does not record the context-window limit here.' -f $session.ContextTokens
             } else { 'No token measurement has been written yet.' }
             Set-RowTip $contextLabel $contextTip
-            $usageLabel = New-ThemeText $uiLiveRows $session.UsageDisplay 535 $y $theme.Head 95 $fontBase
+            $usageLabel = New-ThemeText $row $session.UsageDisplay 535 $y $theme.Head 95 $fontBase
             Set-RowTip $usageLabel $session.UsageDetail
             # Keep the right edge inside the viewport even when the vertical
             # scrollbar is present; horizontal scrolling is never needed here.
-            $permissionLabel = New-ThemeText $uiLiveRows $session.Permission 634 $y $theme.Head 100 $fontBase
+            $permissionLabel = New-ThemeText $row $session.Permission 634 $y $theme.Head 100 $fontBase
             Set-RowTip $permissionLabel ('Launch permission mode: ' + $session.Permission)
             $projectDetails = @()
             if ($session.Workspace) { $projectDetails += $session.Workspace }
             $projectDetails += ('Started {0:g}' -f $session.Started)
             $projectDetails += ('Agent PID {0}; terminal PID {1}' -f $session.AgentId, $session.TerminalId)
             Set-RowTip $projectLabel ($projectDetails -join "`r`n")
+
+            # Every label as well as the row itself, or the pointer falls
+            # through the gaps between them. Which row is being pointed at comes
+            # from the sender, so all rows share one set of handlers.
+            foreach ($target in (@($row) + @($row.Controls))) {
+                $target.Add_MouseEnter($script:rowEnter)
+                $target.Add_MouseLeave($script:rowLeave)
+                $target.Add_Click($script:rowClick)
+            }
 
             $rowIndex++
         }
@@ -2674,6 +3155,71 @@ function Refresh-LiveSessions {
     $uiLiveRows.ResumeLayout()
     $uiLiveSummary.Text = if ($script:liveSessions.Count -eq 1) { '1 live terminal session' } else {
         '{0} live terminal sessions' -f $script:liveSessions.Count
+    }
+    Set-ThemeButtonAvailable $uiLiveCompact ($script:liveSessions.Count -gt 0)
+}
+
+# '/compact' is typed into each session in turn. Both CLIs accept it, and both
+# take it as an ordinary prompt line, so a session that is mid-answer queues it
+# rather than losing it.
+function Invoke-CompactAllSessions {
+    $targets = @($script:liveSessions)
+    if ($targets.Count -eq 0) { return }
+
+    $lines = @($targets | ForEach-Object {
+        '    {0}  {1}  ({2})' -f $_.Agent.PadRight(6), $_.Project, $_.ContextDisplay
+    })
+    $question = @(
+        ('Type /compact into these {0} sessions, one after another?' -f $targets.Count),
+        ''
+    ) + $lines + @(
+        '',
+        'Each terminal is brought to the front in turn, so leave the mouse and',
+        'keyboard alone until it finishes. Anything already typed but unsent in a',
+        'session gets sent along with the command.'
+    )
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        $form, ($question -join "`r`n"), 'Compact all live sessions',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    Set-ThemeButtonAvailable $uiLiveCompact $false
+    $uiLiveRefresh.Enabled = $false
+    $sent = 0
+    $skipped = @()
+    try {
+        $index = 0
+        foreach ($session in $targets) {
+            $index++
+            $uiLiveSummary.Text = 'Compacting {0} of {1}: {2}...' -f $index, $targets.Count, $session.Project
+            [System.Windows.Forms.Application]::DoEvents()
+            $result = Send-SessionCommand -Session $session -Command '/compact'
+            if ($result -eq 'sent') {
+                $sent++
+            } else {
+                $skipped += ('{0} ({1})' -f $session.Project, (Get-TabAgentReason $result))
+            }
+        }
+    } finally {
+        $uiLiveRefresh.Enabled = $true
+        # Take the foreground back from whichever terminal typed last.
+        [void][Launcher.WindowFocus]::Activate($form.Handle)
+        Refresh-LiveSessions
+    }
+
+    $summary = if ($skipped.Count -eq 0) {
+        'Sent /compact to {0} of {1} sessions.' -f $sent, $targets.Count
+    } else {
+        'Sent /compact to {0} of {1}. Skipped: {2}' -f $sent, $targets.Count, ($skipped -join '; ')
+    }
+    $uiLiveSummary.Text = $summary
+    if ($skipped.Count -gt 0) {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            $form,
+            ($summary + "`r`n`r`nA skipped session was left untouched. Open its tab and run /compact there."),
+            'Compact all', [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information)
     }
 }
 
@@ -2996,7 +3542,7 @@ $uiVaultLinkSet.Add_Click({
 
 $uiProjectBrowse.Add_Click({
     # A work folder can be a project or a notes folder.
-    $picked = Show-FolderPicker -Roots @($codeProjectsRoot, $vaultRoot) `
+    $picked = Show-FolderPicker -Roots @($codeProjectsRoot, $vaultRoot) -AllowAnywhere `
         -Title 'Choose a work folder' -Initial (Get-SelectedProjectPath)
     if (-not $picked) { return }
     $script:hiddenProjects = @($script:hiddenProjects | Where-Object { -not (Test-SamePath $_ $picked) })
@@ -3143,6 +3689,7 @@ Update-Details
 Set-LauncherView 'new'
 
 $dialogResult = $form.ShowDialog()
+Remove-TabAgentScript
 
 if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
     Start-AgentTerminal -SelectedAgent $script:chosenAgent -WorkingDirectory $script:chosenProject `

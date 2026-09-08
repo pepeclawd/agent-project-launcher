@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.4
+
+- The work folder can be any folder on the machine. The configured roots are a shorthand for the
+  list and the picker, not a boundary.
+- UNC shares work throughout: paths resolve to `\\server\share\...` rather than the provider-qualified
+  form, and a share root is named after its host and share instead of being handed an empty name.
+- The folder picker labels its path box, offers any share already in use as a browsable root, and
+  adds a share to the tree as soon as one is typed.
+- Two folders with the same name are told apart in the folder list by the folder above them.
+- Live sessions: clicking a session offers going to its terminal tab, with the caret in its prompt
+  and nothing typed, or compacting that one session.
+- Live sessions: a Compact all button types `/compact` into every session in turn, skipping any
+  whose tab cannot be identified with certainty rather than guessing.
+- The tab lookup runs in a helper process. Done in-process, the first UI Automation call made the
+  launcher DPI-aware and its window collapsed to a fraction of its size on a scaled display, with
+  the text still drawn full size and every column and button cutting off its own text.
+- Only tabs belonging to a terminal host are eligible, so a browser or Explorer tab that happens to
+  share a session's name can no longer be typed into.
+- Fixed tab selection never working at all: candidates accumulated into `$matches`, which every
+  regex test in the loop overwrote.
+
 ## 1.0.3
 
 - Opening Advanced options no longer pushes Open terminal and Cancel out of the window.
