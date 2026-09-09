@@ -11,6 +11,7 @@ $dist = Join-Path $source 'dist'
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('AgentProjectLauncher-' + [guid]::NewGuid().ToString('N'))
 $package = Join-Path $stage 'AgentProjectLauncher'
 $zip = Join-Path $dist ("AgentProjectLauncher-$Version-Windows.zip")
+$checksum = $zip + '.sha256'
 
 try {
     [void](New-Item -ItemType Directory -Path $package -Force)
@@ -22,8 +23,10 @@ try {
     if (-not (Test-Path -LiteralPath $dist -PathType Container)) { [void](New-Item -ItemType Directory -Path $dist -Force) }
     if (Test-Path -LiteralPath $zip -PathType Leaf) { Remove-Item -LiteralPath $zip -Force }
     Compress-Archive -LiteralPath $package -DestinationPath $zip -CompressionLevel Optimal
+    $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+    [System.IO.File]::WriteAllText($checksum, ($hash + '  ' + (Split-Path -Leaf $zip) + "`r`n"), [System.Text.Encoding]::ASCII)
     Write-Host $zip
+    Write-Host $checksum
 } finally {
     if (Test-Path -LiteralPath $stage -PathType Container) { Remove-Item -LiteralPath $stage -Recurse -Force }
 }
-

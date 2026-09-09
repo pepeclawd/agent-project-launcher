@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+## 1.0.5
 
+- Starting a session leaves the launcher open, making it possible to launch or
+  inspect another session without reopening the app.
+- Live sessions say `waiting` before an agent has completed its first turn and
+  written a context measurement, with the reason available on hover.
 - The launcher window comes to the front. Started from a shortcut that hides the
   console, it was created but never raised, so it opened behind whatever was already
   on screen and looked like it had not opened at all.

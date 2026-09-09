@@ -793,7 +793,9 @@ function Get-CompactModelName {
 
 function Format-ContextTokens {
     param([long]$Tokens, [long]$Window = 0)
-    if ($Tokens -le 0) { return '—' }
+    # Neither CLI writes a token count before the first turn. Calling that state
+    # "waiting" distinguishes it from a failed lookup or an empty context.
+    if ($Tokens -le 0) { return 'waiting' }
     $short = if ($Tokens -ge 1000000) { '{0:0.0}m' -f ($Tokens / 1000000) } else { '{0:0}k' -f ($Tokens / 1000) }
     if ($Window -gt 0) {
         $percent = [math]::Min(999, [math]::Round(($Tokens * 100.0) / $Window))
@@ -1422,9 +1424,9 @@ function Start-AgentConsole {
                   (ConvertTo-WtArgument $Title),
                   (ConvertTo-WtArgument $WorkingDirectory),
                   (ConvertTo-WtArgument $Command)
-        # The launcher is on its way out as this runs, so it hands its right to
-        # the foreground on. Without it Windows lets wt add the tab but leaves
-        # the window wherever it was in the stack, which looks like a no-op.
+        # Hand the foreground right to Terminal. Without it Windows can add the
+        # tab but leave the terminal wherever it was in the stack, which looks
+        # like a no-op. The launcher itself remains open behind the terminal.
         try { [void][Launcher.WindowFocus]::AllowSetForegroundWindow(0xFFFFFFFF) } catch { }
         Start-Process -FilePath 'wt.exe' -ArgumentList $wtLine
         return
@@ -3321,7 +3323,9 @@ function Refresh-LiveSessions {
                     $session.ContextTokens, $session.ContextWindow, "`r`n"
             } elseif ($session.ContextTokens -gt 0) {
                 '{0:N0} tokens currently used. Claude does not record the context-window limit here.' -f $session.ContextTokens
-            } else { 'No token measurement has been written yet.' }
+            } else {
+                '{0} has not written a token measurement yet. It normally appears after the first completed turn; then click Refresh.' -f $session.Agent
+            }
             Set-RowTip $contextLabel $contextTip
             $usageLabel = New-ThemeText $row $session.UsageDisplay 535 $y $theme.Head 95 $fontBase
             Set-RowTip $usageLabel $session.UsageDetail
@@ -3796,17 +3800,6 @@ $uiContextRemove.Add_Click({
     Update-Details
 })
 
-$script:chosenAgent = $null
-$script:chosenProject = $null
-$script:chosenContexts = @()
-$script:chosenModel = ''
-$script:chosenMode = ''
-$script:chosenStart = ''
-$script:chosenPrompt = ''
-$script:chosenEffort = ''
-$script:chosenPersona = ''
-$script:chosenWeb = ''
-
 $uiStart.Add_Click({
     try {
         $workPath = Get-SelectedProjectPath
@@ -3854,24 +3847,16 @@ $uiStart.Add_Click({
             )
             if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
         }
-        $script:chosenAgent    = $agentName
-        $script:chosenProject  = $workPath
-        $script:chosenContexts = $contexts
-        $script:chosenModel    = $modelName
-        $script:chosenMode     = $modeName
-        $script:chosenStart    = $startName
-        $script:chosenPrompt   = $promptText
-        $script:chosenEffort   = $effortName
-        $script:chosenPersona  = $personaName
-        $script:chosenWeb      = $webName
         $script:lastAgent      = $agentName
         $script:lastProject    = $workPath
         Save-ProjectContexts
         Save-ProjectMode
         Save-AgentModel
         Save-LauncherSettings
-        $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
-        $form.Close()
+        Start-AgentTerminal -SelectedAgent $agentName -WorkingDirectory $workPath `
+            -ContextDirectories $contexts -SelectedModel $modelName -SelectedMode $modeName `
+            -StartMode $startName -OpeningPrompt $promptText `
+            -SelectedEffort $effortName -SelectedPersona $personaName -SelectedWeb $webName
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, 'Cannot start agent')
     }
@@ -3889,31 +3874,8 @@ Refresh-PersonaChoices
 Update-Details
 Set-LauncherView 'new'
 
-$dialogResult = $form.ShowDialog()
+[void]$form.ShowDialog()
 Remove-TabAgentScript
-
-if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
-    # The window has closed by now, so anything thrown here has nowhere to go.
-    # The shortcut runs powershell with -WindowStyle Hidden, and a hidden
-    # console swallows the message and the exit code alike: from the desktop a
-    # failed launch is indistinguishable from one that quietly did nothing.
-    # Say so in the only surface left.
-    try {
-        Start-AgentTerminal -SelectedAgent $script:chosenAgent -WorkingDirectory $script:chosenProject `
-            -ContextDirectories $script:chosenContexts -SelectedModel $script:chosenModel -SelectedMode $script:chosenMode `
-            -StartMode $script:chosenStart -OpeningPrompt $script:chosenPrompt `
-            -SelectedEffort $script:chosenEffort -SelectedPersona $script:chosenPersona -SelectedWeb $script:chosenWeb
-    } catch {
-        [void][System.Windows.Forms.MessageBox]::Show(
-            $_.Exception.Message,
-            'Cannot start agent',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Warning
-        )
-    }
-}
-
-
 
 
 
