@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The launcher window comes to the front. Started from a shortcut that hides the
+  console, it was created but never raised, so it opened behind whatever was already
+  on screen and looked like it had not opened at all.
 - Sessions open in a Windows Terminal window of their own rather than as a tab in
   whichever window was used most recently, where they were easy to miss entirely.
 - A launch that fails now says so. It ran after the window had closed, so the error

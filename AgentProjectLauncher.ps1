@@ -2483,6 +2483,22 @@ $form.Add_Shown({
     # avoids their temporary white system-theme rectangles on the first frame.
     $form.Refresh()
     $form.Opacity = 1
+    # Come to the front. The shortcut starts powershell with -WindowStyle
+    # Hidden to keep its console out of the way, and WinForms takes that as
+    # the show state for the first window it creates: the form is built and
+    # made visible but never raised, so it opens behind whatever is already
+    # on screen. On an empty desktop that goes unnoticed; with anything
+    # maximised in front it looks exactly like a launcher that never opened.
+    $raised = $false
+    try { $raised = [Launcher.WindowFocus]::Activate($form.Handle) } catch { }
+    if (-not $raised) {
+        # Windows would not hand the foreground over. Topmost is not a state
+        # to leave a window in - it would then sit over everything else - so
+        # it goes on only long enough to lift this one to the top.
+        $form.TopMost = $true
+        $form.TopMost = $false
+        $form.Activate()
+    }
     $uiStart.Focus()
 })
 
