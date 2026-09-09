@@ -1263,6 +1263,11 @@ function Find-ActiveAgentTerminal {
 # left as "let Windows decide" a machine with no Terminal already running
 # decides against it - the session opens in conhost instead, blue and tabless.
 # Naming wt.exe takes the guess out.
+
+# Sessions share one Terminal window of their own, kept apart from whatever
+# else the user has open in Terminal.
+$script:agentWindowName = 'agent-sessions'
+
 function ConvertTo-WtArgument {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
     # wt splits its own command line on ';' and eats '"' as it re-joins the
@@ -1286,12 +1291,22 @@ function Start-AgentConsole {
         # Quoting the PowerShell command also stops wt collapsing the double
         # spaces that the window title itself uses as a separator.
         #
-        # '-w 0' reuses the most recently used Terminal window and opens one
-        # when none is running, so sessions gather as tabs, not loose windows.
-        $wtLine = '-w 0 nt --title "{0}" -d "{1}" powershell.exe -NoLogo -NoExit -Command "{2}"' -f
+        # A named window, not '-w 0'. '0' means the most recently used Terminal
+        # window, which is whichever one the user happened to touch last: the
+        # session lands as a tab in the middle of their own work, behind
+        # whatever is in front, and reads as nothing having opened at all.
+        # Naming the window keeps sessions gathered together - the tab walk
+        # still wants that - in a window of their own, and the first launch
+        # creates it, so something visibly appears.
+        $wtLine = '-w {0} nt --title "{1}" -d "{2}" powershell.exe -NoLogo -NoExit -Command "{3}"' -f
+                  $script:agentWindowName,
                   (ConvertTo-WtArgument $Title),
                   (ConvertTo-WtArgument $WorkingDirectory),
                   (ConvertTo-WtArgument $Command)
+        # The launcher is on its way out as this runs, so it hands its right to
+        # the foreground on. Without it Windows lets wt add the tab but leaves
+        # the window wherever it was in the stack, which looks like a no-op.
+        try { [void][Launcher.WindowFocus]::AllowSetForegroundWindow(0xFFFFFFFF) } catch { }
         Start-Process -FilePath 'wt.exe' -ArgumentList $wtLine
         return
     }
