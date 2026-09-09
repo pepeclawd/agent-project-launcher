@@ -3749,10 +3749,24 @@ $dialogResult = $form.ShowDialog()
 Remove-TabAgentScript
 
 if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
-    Start-AgentTerminal -SelectedAgent $script:chosenAgent -WorkingDirectory $script:chosenProject `
-        -ContextDirectories $script:chosenContexts -SelectedModel $script:chosenModel -SelectedMode $script:chosenMode `
-        -StartMode $script:chosenStart -OpeningPrompt $script:chosenPrompt `
-        -SelectedEffort $script:chosenEffort -SelectedPersona $script:chosenPersona -SelectedWeb $script:chosenWeb
+    # The window has closed by now, so anything thrown here has nowhere to go.
+    # The shortcut runs powershell with -WindowStyle Hidden, and a hidden
+    # console swallows the message and the exit code alike: from the desktop a
+    # failed launch is indistinguishable from one that quietly did nothing.
+    # Say so in the only surface left.
+    try {
+        Start-AgentTerminal -SelectedAgent $script:chosenAgent -WorkingDirectory $script:chosenProject `
+            -ContextDirectories $script:chosenContexts -SelectedModel $script:chosenModel -SelectedMode $script:chosenMode `
+            -StartMode $script:chosenStart -OpeningPrompt $script:chosenPrompt `
+            -SelectedEffort $script:chosenEffort -SelectedPersona $script:chosenPersona -SelectedWeb $script:chosenWeb
+    } catch {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            $_.Exception.Message,
+            'Cannot start agent',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+    }
 }
 
 
