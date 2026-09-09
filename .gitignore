@@ -2,3 +2,4 @@ dist/
 *.zip
 settings.json
 config.json
+*.bak-*
