@@ -1257,6 +1257,49 @@ function Find-ActiveAgentTerminal {
     return $null
 }
 
+# Windows Terminal is the intended host: the live-session tab walk below assumes
+# every session is a tab inside one Terminal window. Plain powershell.exe only
+# lands there when Windows hands the console off, and with the default terminal
+# left as "let Windows decide" a machine with no Terminal already running
+# decides against it - the session opens in conhost instead, blue and tabless.
+# Naming wt.exe takes the guess out.
+function ConvertTo-WtArgument {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    # wt splits its own command line on ';' and eats '"' as it re-joins the
+    # rest, so both have to reach it escaped. Left alone, a semicolon ends the
+    # command there and wt drops everything after it without a word: the
+    # workspace marker survives, the title and the agent invocation do not.
+    ($Value -replace '"', '\"') -replace ';', '\;'
+}
+
+function Start-AgentConsole {
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [Parameter(Mandatory)][string]$Title
+    )
+    if (Get-Command 'wt.exe' -CommandType Application -ErrorAction SilentlyContinue) {
+        # Windows PowerShell joins an -ArgumentList array on spaces and quotes
+        # none of it, which strands every value holding a space: '>_  Project'
+        # reaches wt as two arguments and the tab never opens. So the command
+        # line is written out whole here, each value quoted deliberately.
+        # Quoting the PowerShell command also stops wt collapsing the double
+        # spaces that the window title itself uses as a separator.
+        #
+        # '-w 0' reuses the most recently used Terminal window and opens one
+        # when none is running, so sessions gather as tabs, not loose windows.
+        $wtLine = '-w 0 nt --title "{0}" -d "{1}" powershell.exe -NoLogo -NoExit -Command "{2}"' -f
+                  (ConvertTo-WtArgument $Title),
+                  (ConvertTo-WtArgument $WorkingDirectory),
+                  (ConvertTo-WtArgument $Command)
+        Start-Process -FilePath 'wt.exe' -ArgumentList $wtLine
+        return
+    }
+    # No Windows Terminal on this machine, so take whatever host Windows picks.
+    Start-Process -FilePath "$PSHOME\powershell.exe" -WorkingDirectory $WorkingDirectory `
+        -ArgumentList @('-NoLogo', '-NoExit', '-Command', $Command)
+}
+
 function Start-AgentTerminal {
     param(
         [Parameter(Mandatory)][string]$SelectedAgent,
@@ -1288,8 +1331,7 @@ function Start-AgentTerminal {
     # The marker makes future active-session checks exact even when two folders
     # on different drives share the same leaf name.
     $command = '$env:AGENT_LAUNCHER_WORKSPACE = {0}; $Host.UI.RawUI.WindowTitle = {1}; {2}' -f $quotedWork, $quotedTitle, $invoke
-    Start-Process -FilePath "$PSHOME\powershell.exe" -WorkingDirectory $preview.WorkingDirectory `
-        -ArgumentList @('-NoLogo', '-NoExit', '-Command', $command)
+    Start-AgentConsole -Command $command -WorkingDirectory $preview.WorkingDirectory -Title $preview.WindowTitle
 }
 
 # ------------------------------------------------------- command-line mode ---
