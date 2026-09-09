@@ -168,10 +168,10 @@ $script:claudeUsageEnabled = [bool]($publicConfig -and $publicConfig.ClaudeAccou
 $claudePath = if ($publicConfig -and $publicConfig.ClaudePath) { [string]$publicConfig.ClaudePath } else { '' }
 $codexPath = if ($publicConfig -and $publicConfig.CodexPath) { [string]$publicConfig.CodexPath } else { '' }
 $settingsPath = Get-LauncherDataPath 'settings.json'
-# The vault is called whatever its folder is called - 'Notes' by default, but
-# 'Mybrain' or 'Vault' for someone who pointed NotesRoot elsewhere. Naming it
-# after the folder is what makes it recognisable in the list, and what lets it
-# be typed as a shorthand on the command line.
+# The vault is called whatever its folder is called - 'Notes' by default, and
+# whatever NotesRoot points at otherwise. Naming it after the folder is what
+# makes it recognisable in the list, and what lets it be typed as a shorthand
+# on the command line.
 $vaultName = Split-Path -Leaf $vaultRoot
 if (-not $vaultName) { $vaultName = 'Notes' }
 $script:claudeTranscriptByPid = @{}
