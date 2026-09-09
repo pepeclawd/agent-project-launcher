@@ -1,7 +1,8 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$ProjectRoot,
     [string]$NotesRoot,
+    [string]$NotesProjectsRoot,
     [switch]$NoDesktopShortcut
 )
 
@@ -34,11 +35,19 @@ $existing = $null
 if (Test-Path -LiteralPath $configPath -PathType Leaf) {
     try { $existing = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json } catch { $existing = $null }
 }
+# Anything the installer is not asked about is carried over rather than reset:
+# re-running it to pick up a new version should not quietly undo settings that
+# were only ever entered by hand.
+$keptNotesProjects = if ($NotesProjectsRoot) { [System.IO.Path]::GetFullPath($NotesProjectsRoot) }
+                     elseif ($existing -and $existing.NotesProjectsRoot) { [string]$existing.NotesProjectsRoot }
+                     else { '' }
 $config = [ordered]@{
     ProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
     NotesRoot   = [System.IO.Path]::GetFullPath($NotesRoot)
+    NotesProjectsRoot = $keptNotesProjects
     ClaudePath = if ($existing -and $existing.ClaudePath) { [string]$existing.ClaudePath } else { '' }
     CodexPath  = if ($existing -and $existing.CodexPath) { [string]$existing.CodexPath } else { '' }
+    ClaudeAccountLimits = [bool]($existing -and $existing.ClaudeAccountLimits)
 }
 $config | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding UTF8
 

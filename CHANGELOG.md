@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- Sessions open in a Windows Terminal window of their own rather than as a tab in
+  whichever window was used most recently, where they were easy to miss entirely.
+- A launch that fails now says so. It ran after the window had closed, so the error
+  went to a hidden console and the launcher simply vanished.
+- `config.json` and `settings.json` are read from beside the script when a copy sits
+  there, and from `%LOCALAPPDATA%\AgentProjectLauncher` otherwise.
+- New `NotesProjectsRoot` key for a vault that keeps its projects in a subfolder: the
+  folder list and pickers open there, while paths stay relative to the root above it.
+- The notes root is named after the folder it points at, so a root at `D:\Vault` is
+  listed and can be typed as `Vault` rather than `Notes`.
+- Vault links are recognised under any label, not only `Vault notes:`, and a path that
+  begins at the vault folder's own name resolves as well as an absolute one.
+- Fixed: reading a vault link threw, because a .NET call had its argument split on the
+  comma inside its parentheses.
+- New `ClaudeAccountLimits` key, off by default, enabling the Claude account-limit
+  column. It reads the local Claude credential file and calls an endpoint Anthropic
+  does not document, so it stays opt-in.
+- `Install.ps1` keeps config keys it was not asked about instead of resetting them.
+
 ## 1.0.4
 
 - The work folder can be any folder on the machine. The configured roots are a shorthand for the

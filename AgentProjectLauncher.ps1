@@ -130,8 +130,19 @@ if (-not (Test-Path -LiteralPath $script:powerShellExe -PathType Leaf)) {
 
 $documentsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
 if (-not $documentsRoot) { $documentsRoot = Join-Path $env:USERPROFILE 'Documents' }
+# Config and settings are looked for beside the script first, so a checkout run
+# where it sits keeps the whole tool - code, icons and personal paths - in one
+# folder. %LOCALAPPDATA% is the fallback, and where Install.ps1 puts them for a
+# copy installed under Programs. Both file names are in .gitignore, so nobody's
+# paths travel with the repository.
 $launcherDataRoot = Join-Path $env:LOCALAPPDATA 'AgentProjectLauncher'
-$configPath = Join-Path $launcherDataRoot 'config.json'
+function Get-LauncherDataPath {
+    param([Parameter(Mandatory)][string]$FileName)
+    $beside = Join-Path $PSScriptRoot $FileName
+    if (Test-Path -LiteralPath $beside -PathType Leaf) { return $beside }
+    return (Join-Path $launcherDataRoot $FileName)
+}
+$configPath = Get-LauncherDataPath 'config.json'
 $publicConfig = $null
 if (Test-Path -LiteralPath $configPath -PathType Leaf) {
     try { $publicConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json } catch { $publicConfig = $null }
@@ -142,13 +153,31 @@ $codeProjectsRoot = if ($publicConfig -and $publicConfig.ProjectRoot) {
 $vaultRoot = if ($publicConfig -and $publicConfig.NotesRoot) {
     [Environment]::ExpandEnvironmentVariables([string]$publicConfig.NotesRoot)
 } else { Join-Path $documentsRoot 'Notes' }
-$projectsRoot = $vaultRoot
+# A vault usually keeps its projects in a subfolder rather than at its root.
+# That subfolder is what the project list and the folder pickers open on, while
+# the root above it stays what vault paths are shown relative to. Left unset the
+# two are the same folder, which is the behaviour this replaces.
+$projectsRoot = if ($publicConfig -and $publicConfig.NotesProjectsRoot) {
+    [Environment]::ExpandEnvironmentVariables([string]$publicConfig.NotesProjectsRoot)
+} else { $vaultRoot }
+# Off unless a config asks for it. The check reads the local Claude credential
+# file and calls an endpoint Anthropic does not document, so it is not something
+# to switch on for someone by default - a released build behaves as it always
+# has, and an install that wants the column opts in.
+$script:claudeUsageEnabled = [bool]($publicConfig -and $publicConfig.ClaudeAccountLimits)
 $claudePath = if ($publicConfig -and $publicConfig.ClaudePath) { [string]$publicConfig.ClaudePath } else { '' }
 $codexPath = if ($publicConfig -and $publicConfig.CodexPath) { [string]$publicConfig.CodexPath } else { '' }
-$settingsPath = Join-Path $launcherDataRoot 'settings.json'
+$settingsPath = Get-LauncherDataPath 'settings.json'
+# The vault is called whatever its folder is called - 'Notes' by default, but
+# 'Mybrain' or 'Vault' for someone who pointed NotesRoot elsewhere. Naming it
+# after the folder is what makes it recognisable in the list, and what lets it
+# be typed as a shorthand on the command line.
+$vaultName = Split-Path -Leaf $vaultRoot
+if (-not $vaultName) { $vaultName = 'Notes' }
 $script:claudeTranscriptByPid = @{}
 $script:codexTranscriptByPid = @{}
 $script:claudeAccountUsage = $null
+$script:claudeUsageStatus = ''
 
 # ---------------------------------------------------------------- helpers ---
 
@@ -283,8 +312,10 @@ function Save-LauncherSettings {
     foreach ($key in @($script:projectWeb.Keys | Sort-Object)) {
         $projectWebMap[$key] = [string]$script:projectWeb[$key]
     }
-    if (-not (Test-Path -LiteralPath $launcherDataRoot -PathType Container)) {
-        [void](New-Item -ItemType Directory -Path $launcherDataRoot -Force)
+    # Settings are written back wherever they were read from.
+    $settingsDirectory = Split-Path -Parent $settingsPath
+    if ($settingsDirectory -and -not (Test-Path -LiteralPath $settingsDirectory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $settingsDirectory -Force)
     }
     [ordered]@{
         hiddenProjects  = @($script:hiddenProjects | Sort-Object -Unique)
@@ -305,7 +336,7 @@ function Resolve-WorkspacePath {
     # shorthand: a bare name is looked up inside them, and anything else has to
     # be spelled out in full.
     param([Parameter(Mandatory)][string]$Value, [switch]$AllowAnywhere)
-    if ($Value -in @('Notes', 'Notes (root)')) { return $vaultRoot }
+    if ($Value -in @($vaultName, ($vaultName + ' (root)'))) { return $vaultRoot }
     if ($Value -eq '.') { return $codeProjectsRoot }
     if ([System.IO.Path]::IsPathRooted($Value)) {
         if (-not (Test-Path -LiteralPath $Value -PathType Container)) { throw "Folder '$Value' does not exist." }
@@ -338,16 +369,41 @@ function Get-VaultLinks {
     $instructionFiles = @('CLAUDE.md', 'AGENTS.md')
     $present = @()
     $links = @()
+    # Two ways a project names its notes. The first is the line this launcher
+    # writes: the label 'Vault notes:' with a path after it. The second is how
+    # projects wrote it before the launcher existed - any label at all, and a
+    # path that simply begins at the vault folder's own name, so 'Datamodel:'
+    # and 'Vision & planer:' count too. That name comes from the configured
+    # root; nothing here assumes what the folder is called.
+    $vaultLeaf = [regex]::Escape((Split-Path -Leaf $vaultRoot))
     foreach ($name in $instructionFiles) {
         $file = Join-Path $ProjectPath $name
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
         $present += $name
         $text = Get-Content -LiteralPath $file -Raw -ErrorAction SilentlyContinue
         if (-not $text) { continue }
+        $references = @()
         foreach ($match in [regex]::Matches($text, '(?im)^\s*(?:[-*]\s+)?(?:Vault notes|Notes):\s*`?([^`\r\n]+)`?\s*$')) {
-            $reference = $match.Groups[1].Value.Trim().TrimEnd('.', '`', ')', ',', '/', '\')
-            $full = [Environment]::ExpandEnvironmentVariables($reference -replace '/', '\')
-            if (-not [System.IO.Path]::IsPathRooted($full)) { $full = Join-Path $vaultRoot $full }
+            $references += $match.Groups[1].Value
+        }
+        foreach ($match in [regex]::Matches($text, '(?i)' + $vaultLeaf + '[\\/][A-Za-z0-9_\-\.\\/]+')) {
+            $references += $match.Value
+        }
+        foreach ($raw in $references) {
+            $reference = $raw.Trim().TrimEnd('.', '`', ')', ',', '/', '\')
+            if (-not $reference) { continue }
+            $full = [Environment]::ExpandEnvironmentVariables(($reference -replace '/', '\'))
+            # A vault-relative reference starts with the vault folder's name and
+            # an absolute one to the same place contains it, so cutting at that
+            # name resolves both against the configured root - and a vault that
+            # has since moved still lines up.
+            if ($full -match ('(?i)^(?:.*\\)?' + $vaultLeaf + '$')) {
+                $full = $vaultRoot
+            } elseif ($full -match ('(?i)^(?:.*\\)?' + $vaultLeaf + '\\(.+)$')) {
+                $full = Join-Path $vaultRoot $Matches[1]
+            } elseif (-not [System.IO.Path]::IsPathRooted($full)) {
+                $full = Join-Path $vaultRoot $full
+            }
             if (Test-PathInList $full @($links | ForEach-Object { $_.Path })) { continue }
             $links += [pscustomobject]@{
                 Reference = $reference
@@ -623,9 +679,9 @@ function Get-WebArguments {
 # means no context.
 function Get-VaultRelativeLabel {
     param([string]$Path)
-    if (Test-SamePath $Path $vaultRoot) { return 'Notes (root)' }
+    if (Test-SamePath $Path $vaultRoot) { return $vaultName + ' (root)' }
     if ($Path.StartsWith($vaultRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-        return 'Notes\' + $Path.Substring($vaultRoot.Length).TrimStart('\')
+        return $vaultName + '\' + $Path.Substring($vaultRoot.Length).TrimStart('\')
     }
     return $Path
 }
@@ -797,7 +853,7 @@ function Get-ClaudeTranscriptModel {
     # assistant entry. Read only those metadata fields, never message content.
     $workspacePath = $Workspace
     if (-not $workspacePath -and $Project -and $Project -ne '(external)') {
-        if ($Project -eq 'Notes') {
+        if ($Project -eq $vaultName) {
             $workspacePath = $vaultRoot
         } else {
             foreach ($root in @($codeProjectsRoot, $projectsRoot)) {
@@ -956,9 +1012,72 @@ function Get-ClaudeTranscriptModel {
 }
 
 function Get-ClaudeAccountUsage {
-    # No supported public API currently provides Claude account limits.
-    # Transcript context usage remains available in Live sessions.
-    return $null
+    if (-not $script:claudeUsageEnabled) { return $null }
+    # This is the same read-only OAuth endpoint used by Claude's /usage.
+    # Keep the access token local to this function and never return/log errors
+    # that could contain request headers.
+    $accessToken = $null
+    $headers = $null
+    $credentials = $null
+    $client = $null
+    $request = $null
+    $response = $null
+    $script:claudeUsageStatus = ''
+    try {
+        $credentialPath = Join-Path $env:USERPROFILE '.claude\.credentials.json'
+        if (-not (Test-Path -LiteralPath $credentialPath -PathType Leaf)) { return $null }
+        $credentials = Get-Content -LiteralPath $credentialPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $accessToken = [string]$credentials.claudeAiOauth.accessToken
+        if (-not $accessToken) { return $null }
+        $client = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [TimeSpan]::FromSeconds(5)
+        $request = New-Object System.Net.Http.HttpRequestMessage(
+            [System.Net.Http.HttpMethod]::Get,
+            'https://api.anthropic.com/api/oauth/usage'
+        )
+        $request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $accessToken)
+        [void]$request.Headers.TryAddWithoutValidation('anthropic-beta', 'oauth-2025-04-20')
+        $task = $client.SendAsync($request)
+        while (-not $task.IsCompleted) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 25
+        }
+        $response = $task.GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+            $script:claudeUsageStatus = if ([int]$response.StatusCode -eq 429) {
+                'Anthropic rate-limited the usage check. Click Refresh again later.'
+            } else {
+                'Anthropic usage check failed with HTTP {0}.' -f [int]$response.StatusCode
+            }
+            return $null
+        }
+        $json = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $usage = $json | ConvertFrom-Json -ErrorAction Stop
+        if (-not $usage.five_hour -or -not $usage.seven_day) { return $null }
+
+        $fiveHour = [double]$usage.five_hour.utilization
+        $sevenDay = [double]$usage.seven_day.utilization
+        $fiveReset = ([DateTimeOffset]::Parse([string]$usage.five_hour.resets_at)).LocalDateTime
+        $sevenReset = ([DateTimeOffset]::Parse([string]$usage.seven_day.resets_at)).LocalDateTime
+        return [pscustomobject]@{
+            Display = '{0:0}/{1:0}%' -f $fiveHour, $sevenDay
+            Detail  = @(
+                ('5h window: {0:0}% used; resets {1:g}' -f $fiveHour, $fiveReset),
+                ('7d window: {0:0}% used; resets {1:g}' -f $sevenDay, $sevenReset)
+            ) -join "`r`n"
+            MeasuredAt = Get-Date
+        }
+    } catch {
+        if (-not $script:claudeUsageStatus) { $script:claudeUsageStatus = 'Claude usage could not be refreshed.' }
+        return $null
+    } finally {
+        if ($response) { $response.Dispose() }
+        if ($request) { $request.Dispose() }
+        if ($client) { $client.Dispose() }
+        $accessToken = $null
+        $headers = $null
+        $credentials = $null
+    }
 }
 
 function Get-CodexTranscriptState {
@@ -2423,7 +2542,7 @@ function Select-VisibleRows {
 function Build-ProjectRows {
     $candidates = @()
     if (Test-Path -LiteralPath $vaultRoot -PathType Container) {
-        $candidates += [pscustomobject]@{ Display = 'Notes'; Path = $vaultRoot }
+        $candidates += [pscustomobject]@{ Display = $vaultName; Path = $vaultRoot }
     }
 
     # Code folders first: that is where commands and edits should run, so when a
@@ -3135,6 +3254,13 @@ function Refresh-LiveSessions {
                 ("`r`nMeasured {0:g}." -f $script:claudeAccountUsage.MeasuredAt)
             $session.UsageMeasuredAt = $script:claudeAccountUsage.MeasuredAt
         }
+    } elseif ($script:claudeUsageStatus) {
+        # A failed check is worth saying out loud: an empty Limits column reads
+        # as "no limits" rather than "could not ask".
+        foreach ($session in @($script:liveSessions | Where-Object { $_.Agent -eq 'Claude' })) {
+            $session.UsageDisplay = 'retry'
+            $session.UsageDetail = $script:claudeUsageStatus
+        }
     }
     $uiLiveRows.SuspendLayout()
     foreach ($control in @($uiLiveRows.Controls)) { $control.Dispose() }
@@ -3459,7 +3585,9 @@ function Write-InstructionLines {
 # 'Datamodel:' and so on. The shape is what matters: a short label, a colon, and
 # a vault path filling the rest of the line, optionally as a list item. A
 # sentence that happens to mention a vault path is prose and stays.
-$vaultLinePattern = '(?i)^\s*(?:[-*]\s+)?Vault notes:\s*\x60?[^\x60]+\x60?\s*\.?\s*$'
+$vaultLinePattern = '(?i)^\s*(?:[-*]\s+)?[^:\x60]{1,60}:\s*\x60?[^\x60]*' +
+                    [regex]::Escape((Split-Path -Leaf $vaultRoot)) +
+                    '[\\/][^\x60]*\x60?\s*\.?\s*$'
 
 function Get-VaultLinkLines {
     param([Parameter(Mandatory)][string]$ProjectPath)

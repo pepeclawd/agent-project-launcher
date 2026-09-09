@@ -20,7 +20,7 @@ A small Windows launcher for starting and monitoring Claude Code and OpenAI Code
 - [Claude Code](https://code.claude.com/docs) and/or [OpenAI Codex CLI](https://learn.chatgpt.com/docs/codex/cli) installed and signed in.
 - Windows Terminal is recommended.
 
-The launcher discovers `claude` and `codex` from `PATH`. Custom executable paths can be entered in `%LOCALAPPDATA%\AgentProjectLauncher\config.json` after installation.
+The launcher discovers `claude` and `codex` from `PATH`. Custom executable paths can be entered in `config.json`, which is read from the launcher's own folder when a copy sits there and otherwise from `%LOCALAPPDATA%\AgentProjectLauncher`. `settings.json` follows the same rule, so a checkout run where it sits keeps code and configuration in one place. The recognised keys are `ProjectRoot`, `NotesRoot`, `NotesProjectsRoot`, `ClaudePath`, `CodexPath` and `ClaudeAccountLimits`.
 
 ## Install
 
@@ -34,7 +34,7 @@ If Windows blocks the script, open PowerShell in the extracted folder and run:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1
 ```
 
-The configured roots are `Documents\Projects` and `Documents\Notes`. They are a shorthand for
+The configured roots are `Documents\Projects` and `Documents\Notes`. The notes root is named in the folder list after the folder it points at, so a root at `D:\Vault` is listed as `Vault`. A vault that keeps its projects in a subfolder can name it as `NotesProjectsRoot`: the folder list and the pickers open on that subfolder, while paths are still shown relative to the root above it. They are a shorthand for
 the folder list and the picker, not a restriction: any folder on the machine can be a work
 folder, including a UNC share such as `\\server\share`. To choose different roots:
 
@@ -54,7 +54,7 @@ located in a short-lived helper process, and a session whose tab cannot be ident
 is skipped rather than guessed at. Anything already typed but unsent in a session is sent along with
 the command, and moving the mouse or keyboard during a send can carry the keystrokes elsewhere.
 
-Claude account-limit fetching is intentionally disabled in this public build because Claude does not provide a supported public endpoint for it. Claude transcript context usage is still shown when available. Codex limits are read from local session metadata when available.
+Claude account-limit fetching is off unless `ClaudeAccountLimits` is set to `true` in `config.json`. It is off by default because the check reads the local Claude credential file and calls an endpoint Anthropic does not document or support, which can change or stop working without notice. Claude transcript context usage is still shown when available. Codex limits are read from local session metadata when available.
 
 Permission and network controls are passed to the selected CLI. Review the hover help before using broad permissions. `Full access` deliberately removes Codex sandbox protections.
 
