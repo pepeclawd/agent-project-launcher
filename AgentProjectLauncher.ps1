@@ -627,7 +627,7 @@ function Get-ModeArguments {
     if ($Agent -eq 'Claude') {
         switch ($wanted) {
             'Read-only (plan)'         { return @('--permission-mode', 'plan') }
-            'Ask me'                   { return @('--permission-mode', 'manual') }
+            'Ask me'                   { return @('--permission-mode', 'default') }
             'Accept edits'             { return @('--permission-mode', 'acceptEdits') }
             'Full access (no sandbox)' { return @('--permission-mode', 'bypassPermissions') }
             default                    { return @('--permission-mode', 'auto') }
