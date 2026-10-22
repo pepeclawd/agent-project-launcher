@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+- The launcher starts again when a saved project or attached folder is on a network share whose
+  host is offline. Such folders are skipped instead of stopping startup with "The network path
+  was not found", and a quick check of the share's host avoids the long Windows timeout per path.
+- The Live sessions view has an Effort column. It shows each session's current reasoning effort
+  from its transcript, so `/effort` changes are picked up, and falls back to the launch flag.
+- Claude context lookup now finds transcripts for UNC workspaces whose share or project names
+  contain underscores and spaces.
+- A remembered Codex model that is no longer in the CLI's model cache now falls back to the
+  current Codex default instead of failing every newly launched session.
+- The Live sessions view now follows Claude into the new transcript created by `/clear`, so its model and
+  context do not remain stuck on the session state from before the clear.
+- Terminal tabs now keep a unique launcher title instead of allowing agent-generated titles to
+  replace it. Handoffs can therefore target the correct tab when several sessions use one folder,
+  and checkpoint failures now report the specific tab-matching reason.
+- The first-message box is cleared after a terminal opens successfully, so the next new session
+  starts with an empty message instead of reusing the previous session's opening prompt.
+- Live sessions no longer hide Codex sessions launched with `Ask me`, `Accept edits`, or another
+  mode that passes the `--sandbox` permission flag.
+- Session handoff: a live session can be handed off to Claude or Codex. The launcher writes a
+  structured handoff file under `.agent\handoffs` in the work folder, with a short status written
+  either by the old session or by hand, and opens the receiving agent on that file. The old
+  conversation is not passed on. The new `-HandoffFile` parameter starts an agent on an existing
+  handoff file from the command line.
+- A handoff can be planned while the source works: request a checkpoint at its next safe point or
+  automatically when a fresh account-limit measurement reaches 85%. The launcher waits for a
+  complete status before opening the recipient and offers cancellation and manual completion.
+- Handoff timing is now selected on the preparation screen before clicking **Plan / hand off**.
+
 ## 1.0.5
 
 - Starting a session leaves the launcher open, making it possible to launch or

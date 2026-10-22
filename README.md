@@ -10,6 +10,7 @@ A small Windows launcher for starting and monitoring Claude Code and OpenAI Code
 - View live terminal sessions, active model, context health, limits when available, and permissions.
 - Click a live session to jump to its terminal tab with the caret in its prompt, or to compact it.
 - Compact every live session in one action.
+- Hand a live session over to Claude or Codex through a short handoff file.
 - Remember settings per project.
 - Optionally link a project to a notes folder through `AGENTS.md`.
 
@@ -43,6 +44,66 @@ folder, including a UNC share such as `\\server\share`. To choose different root
 ```
 
 The installer writes application files to `%LOCALAPPDATA%\Programs\AgentProjectLauncher` and user configuration to `%LOCALAPPDATA%\AgentProjectLauncher`. It does not install Claude Code or Codex.
+
+## Session handoff
+
+A handoff moves work from one live session to a fresh one, in either direction: Claude to Codex,
+Codex to Claude, or the same agent on another model. The receiving agent reads a short handoff file,
+not the old conversation.
+
+1. In **Live sessions**, click a session and choose **Hand off this session...**.
+2. The **New session** view switches to handoff mode for that session's work folder. The receiving
+   agent, model, effort and permissions are set with the ordinary pickers. The agent defaults to the
+   other one.
+3. Under **Status**, choose who writes the summary:
+   - **Session writes it**: the launcher types a one-line request into the old session. That session
+     writes its status to `.agent\handoffs\<id>.status.md` under fixed headings (Goal, Done, In
+     progress, Next steps, Open questions and risks, Key files), and the launcher waits for the file.
+   - **I write it**: a dialog with the same headings, filled in by hand.
+
+   The handoff falls back to writing it by hand if the old session is read-only, has closed or has a
+   tab that cannot be identified. The same fallback is offered while waiting.
+4. Choose **When?** on the handoff screen, then click **Plan / hand off**. **Cancel handoff** sits beside that button below the settings and returns to **Live sessions** without closing the launcher:
+   - **Hand off now** requests a status immediately, waits briefly and offers manual status if needed.
+   - **Checkpoint at next safe point** asks the source to finish its current safe step, write a
+     checkpoint and stop. The launcher starts the recipient when the status is complete.
+   - **Automatic at 85% account use** arms the handoff now and sends that checkpoint request when a
+     fresh account-limit measurement reaches 85%. The launcher checks every 15 seconds. This is the
+     account limit shown under **Limits**, not the context-window percentage. If no fresh limit
+     measurement is available, it waits; it does not guess from context size.
+
+While armed, the source row shows `[planned]` in **Live sessions**. Its menu offers **Cancel planned
+handoff** and **Complete planned handoff manually...**. Cancellation stops monitoring; it cannot
+recall a checkpoint request already sent. The launcher must remain open for the automatic watcher
+to run. A recipient is started only after the status file has stopped changing and contains the
+required headings. If the source closes without a status or its terminal cannot be reached, the
+launcher offers a manual status instead of starting a recipient on an empty handoff.
+
+The work folder stays fixed to the source session during handoff. A scheduled handoff needs
+**Session writes it** and a writable source session. A source in **Ask me** mode may ask you to
+approve writing its checkpoint. Choosing the same agent for an account-limit trigger may put the
+receiving session under the same account limit. The launcher sends a normal message into the
+source terminal; it cannot guarantee a checkpoint if the CLI hits its limit before processing that
+message. [Claude Code documents how messages queued during tool calls are delivered](https://code.claude.com/docs/en/interactive-mode#queue-messages-while-claude-works).
+
+The handoff file is Markdown with a front matter block: id, time, work folder, the source and
+receiving agent, model and permissions, and where the status came from (`agent`, `manual` or
+`none`). Below that come instructions for the receiving agent, the status, an optional note from
+you, and a snapshot the launcher takes itself: branch, `git status --short` and recent commits.
+The instructions tell the receiving agent to check the status against the repository before relying
+on it.
+
+The old session is left running, so you can close it once the new one has taken over. Handoff files
+stay in the project. Add `.agent/` to the project's `.gitignore` if they should not be committed.
+
+An existing handoff file can also be passed on the command line:
+
+```powershell
+.\AgentProjectLauncher.ps1 -Agent Codex -Project 'D:\Code\MyApp' -HandoffFile '.agent\handoffs\20260915-143210-claude-to-codex.md'
+```
+
+The non-UI threshold, status and single-recipient scenario can be checked with
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\PlannedHandoff.ps1`.
 
 ## Privacy and network behavior
 
