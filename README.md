@@ -4,10 +4,12 @@ A small Windows launcher for starting and monitoring Claude Code and OpenAI Code
 
 ## Features
 
+- Choose Terminal or the shared [Herdr host](HERDR.md), independently of Ordinary/Orchestrator role. Herdr opens projects as Spaces in the same persistent tab and requires a configured local adapter; no binary is bundled.
+
 - Start Claude Code or Codex in any folder on the machine, including a network share.
 - Choose model, permission level, network policy, opening prompt and extra writable folders.
 - Resume or pick an earlier session.
-- View live terminal sessions, active model, context health, limits when available, and permissions.
+- View live terminal sessions, active model, context health, limits when available, and permissions. Each session shows its project folder followed by its editable title in one **Project** column. Click the header to sort by project, or drag the handles between columns to resize them; widths are saved between launches.
 - Click a live session to jump to its terminal tab with the caret in its prompt, or to compact it.
 - Compact every live session in one action.
 - Hand a live session over to Claude or Codex through a short handoff file.

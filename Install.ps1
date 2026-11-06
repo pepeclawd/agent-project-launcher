@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$ProjectRoot,
     [string]$NotesRoot,
@@ -27,6 +27,11 @@ foreach ($directory in @($programRoot, (Join-Path $programRoot 'icons'), $dataRo
 }
 
 Copy-Item -LiteralPath (Join-Path $sourceRoot 'AgentProjectLauncher.ps1') -Destination $programRoot -Force
+Copy-Item -LiteralPath (Join-Path $sourceRoot 'OrchestratorEntry.ps1') -Destination $programRoot -Force
+Copy-Item -LiteralPath (Join-Path $sourceRoot 'HerdrEntry.ps1') -Destination $programRoot -Force
+Copy-Item -LiteralPath (Join-Path $sourceRoot 'HERDR.md') -Destination $programRoot -Force
+Copy-Item -LiteralPath (Join-Path $sourceRoot 'ORCHESTRATOR.md') -Destination $programRoot -Force
+Copy-Item -LiteralPath (Join-Path $sourceRoot 'Start-AgentProjectLauncher.vbs') -Destination $programRoot -Force
 Copy-Item -LiteralPath (Join-Path $sourceRoot 'Uninstall.ps1') -Destination $programRoot -Force
 Copy-Item -LiteralPath (Join-Path $sourceRoot 'icons\agent-launcher.ico') -Destination (Join-Path $programRoot 'icons') -Force
 
@@ -51,14 +56,13 @@ $config = [ordered]@{
 }
 $config | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding UTF8
 
-$scriptPath = Join-Path $programRoot 'AgentProjectLauncher.ps1'
 $iconPath = Join-Path $programRoot 'icons\agent-launcher.ico'
 $shell = New-Object -ComObject WScript.Shell
 function New-LauncherShortcut {
     param([Parameter(Mandatory)][string]$Path)
     $shortcut = $shell.CreateShortcut($Path)
-    $shortcut.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $shortcut.Arguments = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $scriptPath + '"'
+    $shortcut.TargetPath = "$env:SystemRoot\System32\wscript.exe"
+    $shortcut.Arguments = '"' + (Join-Path $programRoot 'Start-AgentProjectLauncher.vbs') + '"'
     $shortcut.WorkingDirectory = $ProjectRoot
     $shortcut.IconLocation = $iconPath + ',0'
     $shortcut.Description = 'Start a Claude Code or OpenAI Codex session'

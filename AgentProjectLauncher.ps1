@@ -11,11 +11,16 @@ param(
     [string]$Persona,
     [ValidateSet('CLI default', 'Restricted', 'Allowed', 'No web tools')][string]$Web,
     [string]$HandoffFile,
+    [ValidateSet('Ordinary', 'Orchestrator')][string]$SessionRole = 'Ordinary',
+    [string]$OrchestratorAdapter,
+    [ValidateSet('Terminal', 'Herdr')][string]$TerminalHost = 'Terminal',
+    [string]$HerdrAdapter,
     [switch]$DryRun
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:launchTerminalHost = $TerminalHost
 
 # Loaded before command-line mode as launch-preview helpers use these types too.
 Add-Type -AssemblyName System.Windows.Forms
@@ -35,6 +40,14 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace Launcher {
+    public static class AppIdentity {
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern int SetCurrentProcessExplicitAppUserModelID(string appID);
+        public static int Set(string appID) {
+            return SetCurrentProcessExplicitAppUserModelID(appID);
+        }
+    }
+
     // A ContextMenuStrip paints itself from ProfessionalColors, which stay
     // light whatever the control's own BackColor says. Supplying the table is
     // the only way to make a dropdown match the rest of the window.
@@ -58,12 +71,6 @@ namespace Launcher {
 
     public class VerticalResizeForm : Form {
         private const int WM_NCHITTEST = 0x0084;
-        private const int HTCLIENT = 1;
-        private const int HTLEFT = 10, HTRIGHT = 11, HTTOP = 12;
-        private const int HTTOPLEFT = 13, HTTOPRIGHT = 14, HTBOTTOM = 15;
-        private const int HTBOTTOMLEFT = 16, HTBOTTOMRIGHT = 17;
-        public bool VerticalResizeOnly { get { return true; } }
-
         public VerticalResizeForm() {
             SetStyle(ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer |
@@ -73,10 +80,6 @@ namespace Launcher {
         protected override void WndProc(ref Message m) {
             base.WndProc(ref m);
             if (m.Msg != WM_NCHITTEST) return;
-            int hit = m.Result.ToInt32();
-            if (hit == HTLEFT || hit == HTRIGHT) m.Result = (IntPtr)HTCLIENT;
-            else if (hit == HTTOPLEFT || hit == HTTOPRIGHT) m.Result = (IntPtr)HTTOP;
-            else if (hit == HTBOTTOMLEFT || hit == HTBOTTOMRIGHT) m.Result = (IntPtr)HTBOTTOM;
         }
     }
 
@@ -169,6 +172,24 @@ $script:claudeUsageEnabled = [bool]($publicConfig -and $publicConfig.ClaudeAccou
 $claudePath = if ($publicConfig -and $publicConfig.ClaudePath) { [string]$publicConfig.ClaudePath } else { '' }
 $codexPath = if ($publicConfig -and $publicConfig.CodexPath) { [string]$publicConfig.CodexPath } else { '' }
 $settingsPath = Get-LauncherDataPath 'settings.json'
+$script:sessionTitlesPath = Get-LauncherDataPath 'session-titles.json'
+$script:sessionTitles = @{}
+if (Test-Path -LiteralPath $script:sessionTitlesPath -PathType Leaf) {
+    try {
+        $savedTitles = Get-Content -LiteralPath $script:sessionTitlesPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($property in $savedTitles.PSObject.Properties) { $script:sessionTitles[$property.Name] = [string]$property.Value }
+    } catch { $script:sessionTitles = @{} }
+}
+# Returns an empty string when saved, otherwise the reason it was not.
+function Save-SessionTitles {
+    try {
+        $json = ConvertTo-Json -InputObject $script:sessionTitles -Depth 4
+        [System.IO.File]::WriteAllText($script:sessionTitlesPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+        return ''
+    } catch {
+        return $_.Exception.Message
+    }
+}
 # The vault is called whatever its folder is called - 'Notes' by default, and
 # whatever NotesRoot points at otherwise. Naming it after the folder is what
 # makes it recognisable in the list, and what lets it be typed as a shorthand
@@ -240,12 +261,12 @@ function Read-SettingText {
 function Get-LauncherSettings {
     $empty = [pscustomobject]@{
         HiddenProjects = @(); SavedProjects = @()
-        LastAgent      = ''; LastProject   = ''
+        LastAgent      = ''; LastProject   = ''; LastSessionRole = 'Ordinary'; LastTerminalHost = 'Terminal'
         ProjectContexts = @{}; AgentModels = @{}; AgentModes = @{}; ProjectModes = @{}; ProjectWeb = @{}
     }
     if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { return $empty }
     try {
-        $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+        $settings = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
         return $empty
     }
@@ -312,6 +333,8 @@ function Get-LauncherSettings {
         SavedProjects   = @(Read-SettingList $settings 'savedProjects')
         LastAgent       = (Read-SettingText $settings 'lastAgent')
         LastProject     = (Read-SettingText $settings 'lastProject')
+        LastSessionRole = (Read-SettingText $settings 'lastSessionRole')
+        LastTerminalHost = (Read-SettingText $settings 'lastTerminalHost')
         ProjectContexts = $projectContexts
         AgentModels     = $agentModels
         AgentModes      = $agentModes
@@ -351,12 +374,14 @@ function Save-LauncherSettings {
         savedProjects   = @($script:savedProjects  | Sort-Object -Unique)
         lastAgent       = [string]$script:lastAgent
         lastProject     = [string]$script:lastProject
+        lastSessionRole = [string]$script:lastSessionRole
+        lastTerminalHost = [string]$script:launchTerminalHost
         projectContexts = $contextMap
         projectModes    = $projectModeMap
         projectWeb      = $projectWebMap
         agentModels     = $modelMap
         agentModes      = $modeMap
-    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $settingsPath -Encoding UTF8
+    } | ConvertTo-Json -Depth 4 | ForEach-Object { [IO.File]::WriteAllText($settingsPath, $_, (New-Object Text.UTF8Encoding($false))) }
 }
 
 function Resolve-WorkspacePath {
@@ -409,7 +434,7 @@ function Get-VaultLinks {
         $file = Join-Path $ProjectPath $name
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
         $present += $name
-        $text = Get-Content -LiteralPath $file -Raw -ErrorAction SilentlyContinue
+        $text = Get-Content -LiteralPath $file -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
         if (-not $text) { continue }
         $references = @()
         foreach ($match in [regex]::Matches($text, '(?im)^\s*(?:[-*]\s+)?(?:Vault notes|Notes):\s*`?([^`\r\n]+)`?\s*$')) {
@@ -473,6 +498,19 @@ function Get-EffortChoices {
     }
     if ($levels.Count -eq 0) { $levels = @('low', 'medium', 'high') }
     return @($effortDefaultLabel) + $levels
+}
+
+function Get-OrchestratorContextPaths {
+    param([string]$ProjectPath, [string[]]$Attached = @())
+    $paths = @()
+    $linked = Get-VaultLinks $ProjectPath
+    foreach ($candidate in @($Attached) + @($linked.Links | Where-Object { $_.Exists } | ForEach-Object { $_.Path })) {
+        if (-not $candidate -or (Test-SamePath $candidate $ProjectPath) -or (Test-SamePath $candidate $vaultRoot)) { continue }
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and [IO.Path]::GetExtension($candidate).ToLowerInvariant() -notin @('.md', '.pdf')) { continue }
+        if (-not (Test-PathInList $candidate $paths)) { $paths += $candidate }
+    }
+    return $paths
 }
 
 function Get-EffortArguments {
@@ -947,13 +985,371 @@ function Get-ClaudeTranscriptContinuation {
     return $current
 }
 
+# Boil prompt text down to a one-line label for the Live sessions list: the
+# first sentence of the first non-empty line, cut at a word boundary.
+function ConvertTo-SessionTitle {
+    param([AllowEmptyString()][string]$Text, [int]$MaxLength = 48, [int]$MinLength = 15)
+    # Attachment placeholders such as "[Image #2]" or "[Pasted text #1 +40 lines]".
+    $Text = [regex]::Replace([string]$Text, '\[(?:Image|Pasted text|Pasted image)[^\]]*\]', ' ')
+    $line = @(([string]$Text -split '\r?\n') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) | Select-Object -First 1
+    if (-not $line) { return '' }
+    # Text that opens with a quote mark is something pasted in from another
+    # reply, not the user stating the task.
+    if ($line -match ('^[''"`>' + [char]0x2018 + [char]0x201C + ']')) { return '' }
+    $line = [string]$line -replace '^[#*\-\s]+', ''
+    # A slash command or a short reply ("ok", "api error?") says nothing about
+    # the work. Names and summaries pass a lower floor: "lint errors" is a title.
+    if ($line.StartsWith('/') -or $line.Length -lt $MinLength) { return '' }
+    $sentence = [regex]::Match($line, '^.{12,}?[.!?](?=\s|$)')
+    if ($sentence.Success) { $line = $sentence.Value.TrimEnd('.') }
+    if ($line.Length -gt $MaxLength) {
+        $cut = $line.Substring(0, $MaxLength - 1)
+        $space = $cut.LastIndexOf(' ')
+        if ($space -ge 20) { $cut = $cut.Substring(0, $space) }
+        $line = $cut.TrimEnd(' ', ',', ';', ':', '-') + [string][char]0x2026
+    }
+    return $line
+}
+
+function Get-TranscriptRecordField {
+    param([string]$Record, [string]$Field)
+    if (-not $Record -or $Record.Length -gt 65536) { return '' }
+    try { return [string](($Record | ConvertFrom-Json -ErrorAction Stop).$Field) } catch { return '' }
+}
+
+# Codex names each thread in one index file shared by all sessions; the id is
+# the tail of the rollout's file name.
+$script:codexThreadNames = @{}
+$script:codexThreadNamesStamp = ''
+function Get-CodexThreadName {
+    param([string]$ThreadId)
+    if (-not $ThreadId) { return '' }
+    $path = Join-Path $env:USERPROFILE '.codex\session_index.jsonl'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return '' }
+    $item = Get-Item -LiteralPath $path
+    $stamp = '{0}:{1}' -f $item.LastWriteTimeUtc.Ticks, $item.Length
+    if ($script:codexThreadNamesStamp -ne $stamp) {
+        $names = @{}
+        $stream = $null
+        $reader = $null
+        try {
+            $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+            # A thread can be renamed, so the last entry for an id wins.
+            while ($null -ne ($line = $reader.ReadLine())) {
+                if ($line -notmatch '"thread_name"') { continue }
+                try {
+                    $entry = $line | ConvertFrom-Json -ErrorAction Stop
+                    if ($entry.id -and $entry.thread_name) { $names[[string]$entry.id] = [string]$entry.thread_name }
+                } catch {
+                }
+            }
+        } catch {
+        } finally {
+            if ($reader) { $reader.Dispose() }
+            if ($stream) { $stream.Dispose() }
+        }
+        $script:codexThreadNames = $names
+        $script:codexThreadNamesStamp = $stamp
+    }
+    if ($script:codexThreadNames.ContainsKey($ThreadId)) { return [string]$script:codexThreadNames[$ThreadId] }
+    return ''
+}
+
+# Run one read-only Herdr CLI call and parse its JSON reply. The launcher UI
+# thread waits on this, so a server that does not answer is abandoned quickly.
+if (-not ('Launcher.ProcessEnvironment' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace Launcher {
+    public static class ProcessEnvironment {
+        [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr process, IntPtr address, byte[] buffer, int size, out IntPtr read);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+        [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr process, int infoClass, byte[] info, int length, out int returned);
+
+        // The NAME=value pairs of another process of the same user. Empty when
+        // the process is gone, not readable, or not the same bitness.
+        public static string[] Read(int pid) {
+            if (IntPtr.Size != 8) return new string[0];
+            IntPtr handle = OpenProcess(0x0410, false, pid);
+            if (handle == IntPtr.Zero) return new string[0];
+            try {
+                byte[] basic = new byte[48]; int returned;
+                if (NtQueryInformationProcess(handle, 0, basic, basic.Length, out returned) != 0) return new string[0];
+                IntPtr peb = (IntPtr)BitConverter.ToInt64(basic, 8);
+                byte[] word = new byte[8]; IntPtr read;
+                if (!ReadProcessMemory(handle, (IntPtr)(peb.ToInt64() + 0x20), word, 8, out read)) return new string[0];
+                long parameters = BitConverter.ToInt64(word, 0);
+                if (!ReadProcessMemory(handle, (IntPtr)(parameters + 0x80), word, 8, out read)) return new string[0];
+                long environment = BitConverter.ToInt64(word, 0);
+                if (!ReadProcessMemory(handle, (IntPtr)(parameters + 0x3F0), word, 8, out read)) return new string[0];
+                long size = BitConverter.ToInt64(word, 0);
+                if (size <= 0 || size > 1048576) size = 65536;
+                byte[] block = new byte[size];
+                if (!ReadProcessMemory(handle, (IntPtr)environment, block, block.Length, out read)) return new string[0];
+                string all = Encoding.Unicode.GetString(block, 0, (int)read.ToInt64());
+                int end = all.IndexOf("\0\0", StringComparison.Ordinal);
+                if (end >= 0) all = all.Substring(0, end);
+                return all.Split('\0');
+            } finally {
+                CloseHandle(handle);
+            }
+        }
+    }
+}
+'@
+}
+
+# A Herdr server started by the launcher's adapter runs in a private
+# environment: XDG_CONFIG_HOME, XDG_STATE_HOME and HERDR_* point at its own
+# folder, which is where its socket lives. Without them the CLI looks in the
+# default place, finds nothing and every call fails. A launcher started from a
+# shortcut has none of it, so it is read off the server process itself.
+$script:herdrEnvironments = @{}
+function Get-HerdrEnvKey {
+    param($ServerRow, [string]$Session)
+    if (-not $ServerRow) { return '' }
+    $key = '{0}|{1}' -f $Session, [int]$ServerRow.ProcessId
+    if (-not $script:herdrEnvironments.ContainsKey($key)) {
+        $values = @{}
+        try {
+            foreach ($pair in @([Launcher.ProcessEnvironment]::Read([int]$ServerRow.ProcessId))) {
+                $split = ([string]$pair).IndexOf('=')
+                if ($split -gt 0) {
+                    $name = ([string]$pair).Substring(0, $split)
+                    if ($name -match '^(XDG_|HERDR_)') { $values[$name] = ([string]$pair).Substring($split + 1) }
+                }
+            }
+        } catch {
+        }
+        $script:herdrEnvironments[$key] = $values
+    }
+    return $key
+}
+
+function Invoke-HerdrJson {
+    # -AcceptEmpty is for commands that print nothing when they work (typing into
+    # a pane); a clean exit then counts as an answer.
+    param([string]$Exe, [string]$Session, [string[]]$Arguments, [string]$EnvKey = '', [switch]$AcceptEmpty)
+    $argumentList = @()
+    if ($Session) { $argumentList += @('--session', $Session) }
+    $argumentList += $Arguments
+    $process = $null
+    try {
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $Exe
+        $startInfo.Arguments = (@($argumentList | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        if ($EnvKey -and $script:herdrEnvironments.ContainsKey($EnvKey)) {
+            foreach ($name in @($script:herdrEnvironments[$EnvKey].Keys)) {
+                $startInfo.EnvironmentVariables[[string]$name] = [string]$script:herdrEnvironments[$EnvKey][$name]
+            }
+        }
+        $process = [System.Diagnostics.Process]::Start($startInfo)
+        $output = $process.StandardOutput.ReadToEndAsync()
+        $errors = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(3000)) {
+            try { $process.Kill() } catch { }
+            return $null
+        }
+        if ($AcceptEmpty -and -not ([string]$output.Result).Trim()) {
+            if ($process.ExitCode -eq 0) { return [pscustomobject]@{ result = 'ok' } }
+            return $null
+        }
+        return ($output.Result | ConvertFrom-Json -ErrorAction Stop)
+    } catch {
+        return $null
+    } finally {
+        if ($process) { $process.Dispose() }
+    }
+}
+
+# Herdr names tabs, not panes, so the tab is looked up from the pane first.
+function Set-HerdrTabTitle {
+    param([string]$Exe, [string]$Session, [string]$PaneId, [string]$Title, [string]$EnvKey = '')
+    if (-not $Exe -or -not $PaneId -or -not $Title) { return $false }
+    $pane = Invoke-HerdrJson -Exe $Exe -Session $Session -EnvKey $EnvKey -Arguments @('pane', 'get', $PaneId)
+    if (-not $pane -or -not $pane.PSObject.Properties['result']) { return $false }
+    $tabId = [string]$pane.result.pane.tab_id
+    if (-not $tabId) { return $false }
+    # Herdr has no end-of-options marker, so a leading dash would be read as an option.
+    $label = ([string]$Title) -replace '^[-\s]+', ''
+    if (-not $label) { return $false }
+    $reply = Invoke-HerdrJson -Exe $Exe -Session $Session -EnvKey $EnvKey -Arguments @('tab', 'rename', $tabId, $label)
+    return [bool]($reply -and $reply.PSObject.Properties['result'])
+}
+
+# The launcher's own shared Herdr session is the one server with a name on its
+# command line; the private pilot servers have none.
+function Get-LauncherHerdrServer {
+    foreach ($row in @(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'" -ErrorAction SilentlyContinue)) {
+        if ([string]$row.CommandLine -match '(?i)--session\s+"?([^"\s]+)"?\s+server' -and $row.ExecutablePath) {
+            $serverSession = $Matches[1]
+            return [pscustomobject]@{ Exe = [string]$row.ExecutablePath; Session = $serverSession; EnvKey = (Get-HerdrEnvKey $row $serverSession) }
+        }
+    }
+    return $null
+}
+
+# A title is put on a Herdr tab once per session. After that the tab is the
+# user's to rename in Herdr without the launcher putting it back.
+$script:herdrTitleApplied = @{}
+
+# Herdr says what a pane runs only when asked, and tabs and panes can be
+# renamed, moved and closed at any time. The picture is therefore taken afresh
+# (at most every few seconds) and never remembered between refreshes, which is
+# how a session moved to another tab would keep its old, now missing, tab.
+$script:herdrSnapshots = @{}
+function Get-HerdrSnapshot {
+    param([string]$Exe, [string]$Session, [string]$EnvKey = '')
+    if ($script:herdrSnapshots.ContainsKey($EnvKey)) {
+        $existing = $script:herdrSnapshots[$EnvKey]
+        if (((Get-Date) - $existing.At).TotalSeconds -lt 4) { return $existing }
+    }
+    $tabs = Invoke-HerdrJson -Exe $Exe -Session $Session -EnvKey $EnvKey -Arguments @('tab', 'list')
+    if (-not $tabs) { return $null }
+    $labels = @{}
+    foreach ($tab in @($tabs.result.tabs)) { $labels[[string]$tab.tab_id] = [string]$tab.label }
+    $panesByPid = @{}
+    $agents = Invoke-HerdrJson -Exe $Exe -Session $Session -EnvKey $EnvKey -Arguments @('agent', 'list')
+    if ($agents) {
+        foreach ($pane in @($agents.result.agents)) {
+            $info = Invoke-HerdrJson -Exe $Exe -Session $Session -EnvKey $EnvKey -Arguments @('pane', 'process-info', '--pane', [string]$pane.pane_id)
+            if (-not $info) { continue }
+            $entry = [pscustomobject]@{ TabId = [string]$pane.tab_id; PaneId = [string]$pane.pane_id }
+            $processInfo = $info.result.process_info
+            $ids = @(@($processInfo.foreground_processes) | ForEach-Object { [int]$_.pid })
+            # The pane's own shell sits above whatever runs in it, so it finds
+            # the pane even while the agent has a tool process in front.
+            if ($processInfo.PSObject.Properties['shell_pid'] -and $processInfo.shell_pid) { $ids += [int]$processInfo.shell_pid }
+            foreach ($id in $ids) { $panesByPid[$id] = $entry }
+        }
+    }
+    $snapshot = [pscustomobject]@{ At = Get-Date; Labels = $labels; PanesByPid = $panesByPid }
+    $script:herdrSnapshots[$EnvKey] = $snapshot
+    return $snapshot
+}
+
+function Get-HerdrPaneInfo {
+    # Herdr names the pane's foreground process, which for Codex is the cmd.exe
+    # shim above node and codex.exe, so every process from the agent up to the
+    # pane's shell is a candidate.
+    param($HerdrRow, [int[]]$ProcessIds)
+    $none = [pscustomobject]@{ Exe = ''; Session = ''; EnvKey = ''; PaneId = ''; TabTitle = '' }
+    try {
+        $exe = [string]$HerdrRow.ExecutablePath
+        if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) { return $none }
+        $session = ''
+        if ([string]$HerdrRow.CommandLine -match '(?i)--session\s+"?([^"\s]+)') { $session = $Matches[1] }
+        $envKey = Get-HerdrEnvKey $HerdrRow $session
+        $snapshot = Get-HerdrSnapshot -Exe $exe -Session $session -EnvKey $envKey
+        if (-not $snapshot) { return $none }
+        $known = $null
+        foreach ($candidateId in $ProcessIds) {
+            if ($snapshot.PanesByPid.ContainsKey([int]$candidateId)) { $known = $snapshot.PanesByPid[[int]$candidateId]; break }
+        }
+        if (-not $known) { return $none }
+        # Whatever the tab is called in Herdr is the title, even a bare
+        # number: it is what the user sees there, so nothing is invented.
+        $tabTitle = ''
+        if ($snapshot.Labels.ContainsKey($known.TabId)) {
+            $tabTitle = ([string]$snapshot.Labels[$known.TabId]).Trim()
+            if ($tabTitle.Length -gt 80) { $tabTitle = $tabTitle.Substring(0, 80).TrimEnd() }
+        }
+        return [pscustomobject]@{ Exe = $exe; Session = $session; EnvKey = $envKey; PaneId = $known.PaneId; TabTitle = $tabTitle }
+    } catch {
+    }
+    return $none
+}
+
+# Herdr runs every session inside one Windows Terminal tab, so there is no tab
+# per session to select. Herdr is asked to focus the session's pane, then the
+# terminal window that hosts Herdr is brought to the front.
+function Invoke-HerdrGoTo {
+    param([Parameter(Mandatory)]$Session)
+    # No pane means the session sits in a Herdr server the launcher cannot talk to.
+    if (-not $Session.HerdrPane -or -not $Session.HerdrExe) { return 'privateherdr' }
+    $reply = Invoke-HerdrJson -Exe $Session.HerdrExe -Session $Session.HerdrSession -EnvKey $Session.HerdrEnvKey -Arguments @('agent', 'focus', [string]$Session.HerdrPane)
+    if (-not $reply -or -not $reply.PSObject.Properties['result']) { return 'notfound' }
+    # The outer tab is titled Herdr, whatever it is showing inside.
+    $outer = [pscustomobject]@{ WindowTitle = 'Herdr'; Project = 'Herdr'; Agent = 'Claude' }
+    return (Invoke-TabAgent -Session $outer)
+}
+
+# Claude registers every live process in ~/.claude/sessions/<pid>.json with its
+# session id and working folder. That is exact where the launcher otherwise has
+# to guess from timestamps and names, and it covers sessions the launcher did
+# not start, such as a `claude` typed by hand in a Herdr pane.
+function Get-ClaudeSessionRecord {
+    param([int]$ProcessId, [datetime]$Started)
+    $path = Join-Path $env:USERPROFILE ('.claude\sessions\{0}.json' -f $ProcessId)
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try {
+        $record = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        # A reused pid would leave another process's record behind.
+        if ($record.PSObject.Properties['procStart'] -and $record.procStart) {
+            $recordStart = [datetime]::FromFileTime([long]$record.procStart)
+            if ([math]::Abs(($recordStart - $Started).TotalSeconds) -gt 5) { return $null }
+        }
+        return [pscustomobject]@{
+            SessionId = if ($record.PSObject.Properties['sessionId']) { [string]$record.sessionId } else { '' }
+            Cwd       = if ($record.PSObject.Properties['cwd']) { [string]$record.cwd } else { '' }
+        }
+    } catch {
+        return $null
+    }
+}
+
+# A session started outside the launcher has no workspace marker, so its
+# transcript folder is unknown. Claude writes the --name value as the first
+# records of the transcript, which identifies the file across all projects.
+function Find-ExternalClaudeTranscript {
+    param([string]$CommandLine, [datetime]$Started)
+    $nameMatch = [regex]::Match($CommandLine, '(?:^|\s)(?:--name|-n)\s+(?:"([^"]+)"|''([^'']+)''|(\S+))')
+    if (-not $nameMatch.Success) { return $null }
+    $name = ($nameMatch.Groups[1].Value, $nameMatch.Groups[2].Value, $nameMatch.Groups[3].Value |
+        Where-Object { $_ } | Select-Object -First 1)
+    $claimed = @($script:claudeTranscriptByPid.Values)
+    $root = Join-Path $env:USERPROFILE '.claude\projects'
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { return $null }
+    $candidates = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -File -Filter '*.jsonl' -ErrorAction SilentlyContinue } |
+        Where-Object { $_.CreationTime -ge $Started.AddSeconds(-5) -and $claimed -notcontains $_.FullName } |
+        Sort-Object CreationTime)
+    foreach ($candidate in $candidates) {
+        $stream = $null
+        try {
+            $stream = [System.IO.File]::Open($candidate.FullName, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $buffer = New-Object byte[] ([int][math]::Min($stream.Length, 4KB))
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            $head = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+            $titleMatch = [regex]::Match($head, '"customTitle"\s*:\s*"((?:[^"\\]|\\.)*)"')
+            if ($titleMatch.Success -and $titleMatch.Groups[1].Value -ceq $name) { return $candidate }
+        } catch {
+        } finally {
+            if ($stream) { $stream.Dispose() }
+        }
+    }
+    return $null
+}
+
 function Get-ClaudeTranscriptModel {
     param(
         [string]$Workspace,
         [string]$Project,
         [datetime]$Started,
         [string]$CommandLine,
-        [int]$ProcessId
+        [int]$ProcessId,
+        [string]$RegisteredSessionId = ''
     )
 
     # Claude changes /model inside the running process, so its command line
@@ -973,15 +1369,6 @@ function Get-ClaudeTranscriptModel {
             }
         }
     }
-    if (-not $workspacePath) { return $null }
-
-    $projectKey = ConvertTo-ClaudeProjectKey $workspacePath
-    $transcriptDirectory = Join-Path (Join-Path $env:USERPROFILE '.claude\projects') $projectKey
-    if (-not (Test-Path -LiteralPath $transcriptDirectory -PathType Container)) { return $null }
-
-    $files = @(Get-ChildItem -LiteralPath $transcriptDirectory -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
-    if ($files.Count -eq 0) { return $null }
-
     $transcript = $null
     $certain = $false
     $pidKey = [string]$ProcessId
@@ -992,12 +1379,31 @@ function Get-ClaudeTranscriptModel {
         }
     }
 
+    if ($workspacePath) {
+        $projectKey = ConvertTo-ClaudeProjectKey $workspacePath
+        $transcriptDirectory = Join-Path (Join-Path $env:USERPROFILE '.claude\projects') $projectKey
+    } else {
+        if (-not $transcript) {
+            $transcript = Find-ExternalClaudeTranscript -CommandLine $CommandLine -Started $Started
+            if ($transcript) { $certain = $true }
+        }
+        if (-not $transcript) { return $null }
+        $transcriptDirectory = $transcript.DirectoryName
+    }
+    if (-not (Test-Path -LiteralPath $transcriptDirectory -PathType Container)) { return $null }
+
+    $files = @(Get-ChildItem -LiteralPath $transcriptDirectory -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) { return $null }
+
     if (-not $transcript) {
         # An explicit resume exposes the session id. A new session writes its
         # transcript once the first message is sent, so the file this process
         # created is the one that appeared at or after it started.
         $sessionId = ''
         if ($CommandLine -match '(?i)\b([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\b') { $sessionId = $Matches[1] }
+        # The registry names the session the process is on now, which a
+        # --resume id in the command line may no longer be.
+        if ($RegisteredSessionId) { $sessionId = $RegisteredSessionId }
         if ($sessionId) {
             $transcript = $files | Where-Object { $_.BaseName -eq $sessionId } | Select-Object -First 1
             if ($transcript) { $certain = $true }
@@ -1038,6 +1444,10 @@ function Get-ClaudeTranscriptModel {
     $usageDetail = 'Run /usage in this Claude session, then Refresh, to update limit usage.'
     $usageMeasuredAt = [datetime]::MinValue
     $pendingLocalCommand = ''
+    $customTitleRecord = ''
+    $aiTitleRecord = ''
+    $promptRecords = New-Object System.Collections.Generic.List[string]
+    $lastPromptText = $null
     $stream = $null
     try {
         $stream = [System.IO.File]::Open($transcript.FullName, [System.IO.FileMode]::Open,
@@ -1055,6 +1465,22 @@ function Get-ClaudeTranscriptModel {
                 $record = $lines[$index]
                 $prefix = $record
                 if ($prefix.Length -gt 4096) { $prefix = $prefix.Substring(0, 4096) }
+                # Title records are small and start with their type. Keep the
+                # newest of each; a few prompts back, in case the latest one
+                # is only "ok".
+                if ($prefix.StartsWith('{"type":"last-prompt"', [System.StringComparison]::Ordinal)) {
+                    # Claude rewrites the same prompt on every turn; only a
+                    # change in text takes a slot in the window.
+                    $promptText = [regex]::Match($prefix, '"lastPrompt"\s*:\s*"((?:[^"\\]|\\.)*)"').Groups[1].Value
+                    if ($promptText -ne $lastPromptText) {
+                        $lastPromptText = $promptText
+                        if ($promptRecords.Count -ge 8) { $promptRecords.RemoveAt(0) }
+                        $promptRecords.Add($record)
+                    }
+                    continue
+                }
+                if ($prefix.StartsWith('{"type":"custom-title"', [System.StringComparison]::Ordinal)) { $customTitleRecord = $record; continue }
+                if ($prefix.StartsWith('{"type":"ai-title"', [System.StringComparison]::Ordinal)) { $aiTitleRecord = $record; continue }
                 # The record's own '"type":"assistant"' is written after the
                 # message content, so on any turn longer than the prefix it is
                 # out of reach. The message header is not: role and model sit in
@@ -1120,12 +1546,38 @@ function Get-ClaudeTranscriptModel {
         if ($stream) { $stream.Dispose() }
     }
     if (-not $activeModel) { return $null }
+
+    # A launcher session is started with --name set to its project, which
+    # says nothing about the work and also stops Claude from writing an
+    # ai-title. A name that differs from the project (/rename, or an external
+    # --name) is a deliberate label and wins. Otherwise fall back to the
+    # newest prompt that says something.
+    $autoTitle = ''
+    $titleSource = ''
+    $customTitle = ConvertTo-SessionTitle (Get-TranscriptRecordField $customTitleRecord 'customTitle') 60 3
+    if ($customTitle -and $customTitle -ne $Project) {
+        $autoTitle = $customTitle
+        $titleSource = 'the session name'
+    }
+    if (-not $autoTitle) {
+        $autoTitle = ConvertTo-SessionTitle (Get-TranscriptRecordField $aiTitleRecord 'aiTitle') 60 3
+        if ($autoTitle) { $titleSource = 'Claude''s own summary of the session' }
+    }
+    if (-not $autoTitle) {
+        for ($i = $promptRecords.Count - 1; $i -ge 0 -and -not $autoTitle; $i--) {
+            $autoTitle = ConvertTo-SessionTitle (Get-TranscriptRecordField $promptRecords[$i] 'lastPrompt')
+        }
+        if ($autoTitle) { $titleSource = 'the latest prompt' }
+    }
+
     # Claude 5's CLI context window is one million tokens. The transcript's
     # usage total is the same pre-compaction token count shown by /context.
     [long]$contextWindow = 1000000
     return [pscustomobject]@{
         Display = Get-CompactModelName $activeModel
         Exact   = $activeModel
+        Title   = $autoTitle
+        TitleSource = $titleSource
         Effort  = $activeEffort
         ContextTokens = $contextTokens
         ContextWindow = $contextWindow
@@ -1272,6 +1724,64 @@ function Get-CodexAccountLimitSnapshot {
     return $best
 }
 
+function Find-CodexResumedRollout {
+    # `codex resume` keeps writing to the rollout it was created in, which can
+    # be days old, so it is never in the folder for the day the process started.
+    param(
+        [string]$WorkspacePath,
+        [datetime]$Started,
+        [string]$SessionId,
+        [string[]]$Claimed = @()
+    )
+
+    $sessionsRoot = Join-Path $env:USERPROFILE '.codex\sessions'
+    if (-not (Test-Path -LiteralPath $sessionsRoot -PathType Container)) { return $null }
+    if ($SessionId) {
+        return Get-ChildItem -LiteralPath $sessionsRoot -Recurse -File -Filter ('rollout-*-' + $SessionId + '.jsonl') `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+
+    # `--last` takes the most recently updated session of the folder. Look at
+    # the last two weeks only, and only at rollouts that began before this
+    # process did.
+    $candidates = @()
+    for ($back = 0; $back -le 14; $back++) {
+        $day = (Get-Date).AddDays(-$back)
+        $directory = Join-Path (Join-Path (Join-Path $sessionsRoot $day.ToString('yyyy')) $day.ToString('MM')) $day.ToString('dd')
+        if (-not (Test-Path -LiteralPath $directory -PathType Container)) { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $directory -File -Filter 'rollout-*.jsonl' -ErrorAction SilentlyContinue)) {
+            if ($Claimed -contains $file.FullName) { continue }
+            $stamp = [regex]::Match($file.Name, '^rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-')
+            $created = [datetime]::MinValue
+            if (-not $stamp.Success -or -not [datetime]::TryParseExact($stamp.Groups[1].Value, 'yyyy-MM-ddTHH-mm-ss',
+                    [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$created)) { continue }
+            if ($created -gt $Started) { continue }
+            $reader = $null
+            try {
+                $reader = New-Object System.IO.StreamReader([System.IO.File]::Open($file.FullName,
+                    [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite))
+                $meta = $reader.ReadLine() | ConvertFrom-Json -ErrorAction Stop
+                $source = $meta.payload.source
+                $isCli = ($source -is [string]) -and (@('cli', 'vscode') -contains $source) -and
+                    (@('', 'codex-tui') -contains [string]$meta.payload.originator)
+                $sameWorkspace = (-not $WorkspacePath) -or
+                    ([string]$meta.payload.cwd).TrimEnd('\').Equals($WorkspacePath.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)
+                if ($isCli -and $sameWorkspace) { $candidates += $file }
+            } catch {
+            } finally {
+                if ($reader) { $reader.Dispose() }
+            }
+        }
+    }
+    if ($candidates.Count -eq 0) { return $null }
+    # A rollout written to since the process started is the one it resumed.
+    # With none, the session is idle and `--last` would have picked the
+    # newest one.
+    $written = @($candidates | Where-Object { $_.LastWriteTime -gt $Started } | Sort-Object LastWriteTime -Descending)
+    if ($written.Count -gt 0) { return $written[0] }
+    return ($candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+}
+
 function Get-CodexTranscriptState {
     param(
         [string]$Workspace,
@@ -1285,8 +1795,6 @@ function Get-CodexTranscriptState {
     $dayDirectory = Join-Path $dayDirectory $Started.ToString('yyyy')
     $dayDirectory = Join-Path $dayDirectory $Started.ToString('MM')
     $dayDirectory = Join-Path $dayDirectory $Started.ToString('dd')
-    if (-not (Test-Path -LiteralPath $dayDirectory -PathType Container)) { return $null }
-
     $transcript = $null
     $pidKey = [string]$ProcessId
     if ($script:codexTranscriptByPid.ContainsKey($pidKey)) {
@@ -1295,20 +1803,26 @@ function Get-CodexTranscriptState {
     }
 
     if (-not $transcript) {
-        $files = @(Get-ChildItem -LiteralPath $dayDirectory -File -Filter 'rollout-*.jsonl' -ErrorAction SilentlyContinue)
+        $files = if (Test-Path -LiteralPath $dayDirectory -PathType Container) {
+            @(Get-ChildItem -LiteralPath $dayDirectory -File -Filter 'rollout-*.jsonl' -ErrorAction SilentlyContinue)
+        } else { @() }
         $sessionId = ''
         if ($CommandLine -match '(?i)\b([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\b') { $sessionId = $Matches[1] }
+        $workspacePath = $Workspace
+        if (-not $workspacePath -and $Project -and $Project -ne '(external)') {
+            foreach ($root in @($codeProjectsRoot, $projectsRoot)) {
+                $candidate = Join-Path $root $Project
+                if (Test-Path -LiteralPath $candidate -PathType Container) { $workspacePath = $candidate; break }
+            }
+        }
         if ($sessionId) {
             $transcript = $files | Where-Object { $_.BaseName -like ('*-' + $sessionId) } | Select-Object -First 1
         }
+        if (-not $transcript -and $CommandLine -match '(?i)\s(?:resume|fork)(?:\s|$)') {
+            $claimed = @($script:codexTranscriptByPid.GetEnumerator() | Where-Object { $_.Key -ne $pidKey } | ForEach-Object { [string]$_.Value })
+            $transcript = Find-CodexResumedRollout -WorkspacePath $workspacePath -Started $Started -SessionId $sessionId -Claimed $claimed
+        }
         if (-not $transcript) {
-            $workspacePath = $Workspace
-            if (-not $workspacePath -and $Project -and $Project -ne '(external)') {
-                foreach ($root in @($codeProjectsRoot, $projectsRoot)) {
-                    $candidate = Join-Path $root $Project
-                    if (Test-Path -LiteralPath $candidate -PathType Container) { $workspacePath = $candidate; break }
-                }
-            }
             # Codex names a rollout with the time the CLI session started. On
             # recent builds the JSONL may be materialized (or atomically
             # replaced) several minutes later, which makes the Windows file
@@ -1344,7 +1858,14 @@ function Get-CodexTranscriptState {
                         [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
                     $candidateReader = New-Object System.IO.StreamReader($candidateStream)
                     $meta = $candidateReader.ReadLine() | ConvertFrom-Json -ErrorAction Stop
-                    $isCli = ([string]$meta.payload.source -eq 'cli')
+                    # A terminal session is tagged source=cli by current builds
+                    # and source=vscode by older ones; both write originator
+                    # codex-tui. A subagent rollout has an object as source, so
+                    # requiring a string keeps those out.
+                    $rolloutSource = $meta.payload.source
+                    $isCli = ($rolloutSource -is [string]) -and
+                        (@('cli', 'vscode') -contains $rolloutSource) -and
+                        (@('', 'codex-tui') -contains [string]$meta.payload.originator)
                     $sameWorkspace = (-not $workspacePath) -or
                         ([string]$meta.payload.cwd).Equals($workspacePath, [System.StringComparison]::OrdinalIgnoreCase)
                     if ($isCli -and $sameWorkspace) { $transcript = $candidateFile; break }
@@ -1409,9 +1930,13 @@ function Get-CodexTranscriptState {
     } finally {
         if ($stream) { $stream.Dispose() }
     }
+    $threadId = [regex]::Match($transcript.BaseName, '([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$').Groups[1].Value
+    $threadName = ConvertTo-SessionTitle (Get-CodexThreadName $threadId) 60 3
     return [pscustomobject]@{
         Display = Get-CompactModelName $activeModel
         Exact   = $activeModel
+        Title   = $threadName
+        TitleSource = if ($threadName) { 'the Codex thread name' } else { '' }
         Effort  = $activeEffort
         ContextTokens = $contextTokens
         ContextWindow = $contextWindow
@@ -1425,7 +1950,9 @@ function Get-LiveAgentSessions {
     try {
         # Query only processes that can be an agent or one of its launcher
         # ancestors. Enumerating every Windows process delayed the first paint.
-        $processFilter = "Name='claude.exe' OR Name='codex.exe' OR Name='powershell.exe' OR Name='cmd.exe' OR Name='node.exe'"
+        # python.exe is there for Orchestrator sessions, which the workflow
+        # controller starts through its own Python processes.
+        $processFilter = "Name='claude.exe' OR Name='codex.exe' OR Name='powershell.exe' OR Name='cmd.exe' OR Name='node.exe' OR Name='herdr.exe' OR Name='python.exe'"
         $processRows = @(Get-CimInstance Win32_Process -Filter $processFilter -ErrorAction Stop)
         $byId = @{}
         foreach ($row in $processRows) { $byId[[int]$row.ProcessId] = $row }
@@ -1443,9 +1970,16 @@ function Get-LiveAgentSessions {
             $terminal = $null
             $cursor = $agentRow
             $seen = @{}
+            $paneShell = $null
+            $viaController = $false
             while ($cursor -and -not $seen.ContainsKey([int]$cursor.ProcessId)) {
                 $seen[[int]$cursor.ProcessId] = $true
+                if ([string]$cursor.Name -ieq 'python.exe') { $viaController = $true }
                 if ([string]$cursor.Name -ieq 'powershell.exe') { $terminal = $cursor; break }
+                # An agent typed by hand into a Herdr pane runs under the
+                # pane's own shell (often cmd) with no PowerShell in between.
+                if ([string]$cursor.Name -ieq 'herdr.exe' -and $paneShell) { $terminal = $paneShell; break }
+                if ([int]$cursor.ProcessId -ne [int]$agentRow.ProcessId) { $paneShell = $cursor }
                 $parentId = [int]$cursor.ParentProcessId
                 $cursor = if ($byId.ContainsKey($parentId)) { $byId[$parentId] } else { $null }
             }
@@ -1454,6 +1988,28 @@ function Get-LiveAgentSessions {
             # processes are deliberately excluded.
             if (-not $terminal) { continue }
             $terminalCommand = [string]$terminal.CommandLine
+            # Herdr starts its shells with the setup as a base64
+            # -EncodedCommand, which hides the workspace marker below.
+            if ($terminalCommand -match '(?i)-EncodedCommand\s+([A-Za-z0-9+/=]+)') {
+                try {
+                    $terminalCommand = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1]))
+                } catch {
+                }
+            }
+            $terminalHost = 'Windows Terminal'
+            $herdrRow = $null
+            $hostCursor = $terminal
+            $hostIds = @()
+            for ($level = 0; $hostCursor -and $level -lt 6; $level++) {
+                $hostIds += [int]$hostCursor.ProcessId
+                if ([string]$hostCursor.Name -ieq 'herdr.exe') { $terminalHost = 'Herdr'; $herdrRow = $hostCursor; break }
+                $hostParent = [int]$hostCursor.ParentProcessId
+                $hostCursor = if ($byId.ContainsKey($hostParent)) { $byId[$hostParent] } else { $null }
+            }
+            # An Orchestrator session in a Herdr server with no session name
+            # belongs to a private pilot server the launcher cannot reach, and
+            # those leave old controller sessions running.
+            if ($viaController -and $herdrRow -and [string]$herdrRow.CommandLine -notmatch '(?i)--session\s') { continue }
             $workspace = ''
             if ($terminalCommand -match "(?i)AGENT_LAUNCHER_WORKSPACE\s*=\s*'((?:''|[^'])*)'") {
                 $workspace = $Matches[1] -replace "''", "'"
@@ -1462,9 +2018,16 @@ function Get-LiveAgentSessions {
             if ($terminalCommand -match "(?i)WindowTitle\s*=\s*'((?:''|[^'])*)'") {
                 $windowTitle = $Matches[1] -replace "''", "'"
             }
+            # Without a launcher marker, Claude's own registry says where the
+            # process is working.
+            $claudeRecord = $null
+            if ([string]$agentRow.Name -ieq 'claude.exe') {
+                $claudeRecord = Get-ClaudeSessionRecord -ProcessId ([int]$agentRow.ProcessId) -Started ([datetime]$agentRow.CreationDate)
+                if (-not $workspace -and $claudeRecord -and $claudeRecord.Cwd) { $workspace = $claudeRecord.Cwd }
+            }
             $project = if ($workspace) { Split-Path -Leaf $workspace } elseif ($windowTitle) {
                 ($windowTitle -split '\s{2}\+\s{2}', 2)[0]
-            } else { '(external)' }
+            } elseif ($terminalHost -eq 'Herdr') { 'Herdr' } else { '(external)' }
 
             $agentCommand = [string]$agentRow.CommandLine
             $model = '(default)'
@@ -1478,13 +2041,22 @@ function Get-LiveAgentSessions {
             $usageDisplay = [string][char]0x2014
             $usageDetail = 'No usage-limit measurement is available.'
             $usageMeasuredAt = [datetime]::MinValue
+            $autoTitle = ''
+            $autoTitleSource = ''
             if ($agentName -eq 'Claude') {
-                $transcriptState = Get-ClaudeTranscriptModel -Workspace $workspace -Project $project `
-                    -Started ([datetime]$agentRow.CreationDate) -CommandLine $agentCommand -ProcessId ([int]$agentRow.ProcessId)
+                $registeredSession = if ($claudeRecord) { $claudeRecord.SessionId } else { '' }
+                # The transcript sits under the folder the process runs in. An
+                # Orchestrator session shows its project but runs in a role folder.
+                $transcriptWorkspace = if ($claudeRecord -and $claudeRecord.Cwd) { $claudeRecord.Cwd } else { $workspace }
+                $transcriptState = Get-ClaudeTranscriptModel -Workspace $transcriptWorkspace -Project $project `
+                    -Started ([datetime]$agentRow.CreationDate) -CommandLine $agentCommand -ProcessId ([int]$agentRow.ProcessId) `
+                    -RegisteredSessionId $registeredSession
                 if ($transcriptState) {
                     $currentModel = $transcriptState.Display
                     $modelDetail = $transcriptState.Exact
                     $modelSource = 'active Claude session'
+                    $autoTitle = $transcriptState.Title
+                    $autoTitleSource = $transcriptState.TitleSource
                     $contextTokens = $transcriptState.ContextTokens
                     $contextWindow = $transcriptState.ContextWindow
                     $usageDisplay = $transcriptState.UsageDisplay
@@ -1495,6 +2067,8 @@ function Get-LiveAgentSessions {
                 $transcriptState = Get-CodexTranscriptState -Workspace $workspace -Project $project `
                     -Started ([datetime]$agentRow.CreationDate) -CommandLine $agentCommand -ProcessId ([int]$agentRow.ProcessId)
                 if ($transcriptState) {
+                    $autoTitle = $transcriptState.Title
+                    $autoTitleSource = $transcriptState.TitleSource
                     if ($transcriptState.Display) {
                         $currentModel = $transcriptState.Display
                         $modelDetail = $transcriptState.Exact
@@ -1505,6 +2079,18 @@ function Get-LiveAgentSessions {
                     $usageDisplay = $transcriptState.UsageDisplay
                     $usageDetail = $transcriptState.UsageDetail
                     $usageMeasuredAt = $transcriptState.UsageMeasuredAt
+                }
+            }
+            # A name given to the tab in Herdr is the user's own, so it beats
+            # anything derived from the transcript.
+            $herdrPane = [pscustomobject]@{ Exe = ''; Session = ''; PaneId = ''; TabTitle = '' }
+            if ($herdrRow) {
+                # $seen holds every process from the agent up to its terminal and
+                # $hostIds the ones above it up to Herdr, the pane's shell among them.
+                $herdrPane = Get-HerdrPaneInfo -HerdrRow $herdrRow -ProcessIds @(@($seen.Keys | ForEach-Object { [int]$_ }) + $hostIds)
+                if ($herdrPane.TabTitle) {
+                    $autoTitle = $herdrPane.TabTitle
+                    $autoTitleSource = 'the tab name in Herdr'
                 }
             }
             $launchDetails = Get-LiveLaunchDetails -Agent $agentName -CommandLine $agentCommand
@@ -1526,10 +2112,17 @@ function Get-LiveAgentSessions {
                 Project     = $project
                 Workspace   = $workspace
                 WindowTitle = $windowTitle
+                TerminalHost = $terminalHost
+                HerdrExe    = $herdrPane.Exe
+                HerdrSession = $herdrPane.Session
+                HerdrEnvKey = $herdrPane.EnvKey
+                HerdrPane   = $herdrPane.PaneId
                 StartModel  = $model
                 Model       = $currentModel
                 ModelDetail = $modelDetail
                 ModelSource = $modelSource
+                AutoTitle   = $autoTitle
+                AutoTitleSource = $autoTitleSource
                 Effort      = $effort
                 EffortSource = $effortSource
                 ContextTokens = $contextTokens
@@ -1543,6 +2136,7 @@ function Get-LiveAgentSessions {
                 Started     = [datetime]$agentRow.CreationDate
                 AgentId     = [int]$agentRow.ProcessId
                 TerminalId  = [int]$terminal.ProcessId
+                SessionKey  = ('{0}:{1}' -f [int]$agentRow.ProcessId, ([datetime]$agentRow.CreationDate).Ticks)
             }
         }
         # Limits are account-wide, not session-specific. An idle transcript can
@@ -1608,8 +2202,36 @@ function Start-AgentConsole {
     param(
         [Parameter(Mandatory)][string]$Command,
         [Parameter(Mandatory)][string]$WorkingDirectory,
-        [Parameter(Mandatory)][string]$Title
+        [Parameter(Mandatory)][string]$Title,
+        [string]$TabTitle = ''
     )
+    if ($script:launchTerminalHost -eq 'Herdr') {
+        # This outer Windows Terminal tab belongs to the shared Herdr client;
+        # individual project names remain visible in Herdr's Spaces sidebar.
+        $Title = 'Herdr'
+        Import-HerdrEntry
+        $hostPreview = Get-HerdrHostPreview -WorkingDirectory $WorkingDirectory -AdapterPath $HerdrAdapter -SharedSession
+        $null = Test-HerdrHostReadiness $hostPreview
+        $workspaceResult = Start-HerdrWorkspace -WorkingDirectory $WorkingDirectory -Command $Command -AdapterPath $HerdrAdapter
+        if (-not ($workspaceResult.PSObject.Properties['needs_client'] -and $workspaceResult.needs_client)) {
+            # The pane exists now, so name its tab. A failure here must not look
+            # like a failed launch; the live view tries again.
+            if ($TabTitle -and $workspaceResult.PSObject.Properties['pane_id']) {
+                try {
+                    $server = Get-LauncherHerdrServer
+                    if ($server -and (Set-HerdrTabTitle -Exe $server.Exe -Session $server.Session -EnvKey $server.EnvKey -PaneId ([string]$workspaceResult.pane_id) -Title $TabTitle)) {
+                        $script:herdrTitleApplied['{0}|{1}|{2}' -f $server.Session, $workspaceResult.pane_id, $TabTitle] = $true
+                    }
+                } catch {
+                }
+            }
+            return
+        }
+        # First use bootstraps one stable launcher-owned Herdr TUI. Later
+        # launches create a workspace through its running session API above.
+        $hostPreview = Get-HerdrHostPreview -WorkingDirectory $WorkingDirectory -Command $Command -AdapterPath $HerdrAdapter -SharedSession -LaunchShared
+        $Command = Get-HerdrConsoleCommand $hostPreview
+    }
     if (Get-Command 'wt.exe' -CommandType Application -ErrorAction SilentlyContinue) {
         # Windows PowerShell joins an -ArgumentList array on spaces and quotes
         # none of it, which strands every value holding a space: '>_  Project'
@@ -1656,7 +2278,8 @@ function Start-AgentTerminal {
         [string]$OpeningPrompt = '',
         [string]$SelectedEffort = '',
         [string]$SelectedPersona = '',
-        [string]$SelectedWeb = ''
+        [string]$SelectedWeb = '',
+        [string]$SessionTitle = ''
     )
     $preview = Get-LaunchPreview -SelectedAgent $SelectedAgent -WorkingDirectory $WorkingDirectory -ContextDirectories $ContextDirectories -SelectedModel $SelectedModel -SelectedMode $SelectedMode -StartMode $StartMode -OpeningPrompt $OpeningPrompt -SelectedEffort $SelectedEffort -SelectedPersona $SelectedPersona -SelectedWeb $SelectedWeb
     $activeTerminal = Find-ActiveAgentTerminal $preview
@@ -1670,6 +2293,15 @@ function Start-AgentTerminal {
     # Live sessions can recover it and match one terminal tab exactly.
     $sessionMarker = [guid]::NewGuid().ToString('N').Substring(0, 6)
     $preview.WindowTitle = '{0}  #{1}' -f $preview.WindowTitle, $sessionMarker
+    # A title typed at launch is kept under the marker. Live sessions read it
+    # back from the terminal title, so it survives a launcher restart. Not
+    # being able to save it does not stop the session from starting.
+    $SessionTitle = ([string]$SessionTitle).Trim()
+    if ($SessionTitle.Length -gt 80) { $SessionTitle = $SessionTitle.Substring(0, 80).TrimEnd() }
+    if ($SessionTitle) {
+        $script:sessionTitles['marker:' + $sessionMarker] = $SessionTitle
+        [void](Save-SessionTitles)
+    }
     $quotedTitle = "'" + $preview.WindowTitle.Replace("'", "''") + "'"
     $quotedWork  = "'" + $preview.WorkingDirectory.Replace("'", "''") + "'"
     $quotedExe   = "'" + $preview.Executable.Replace("'", "''") + "'"
@@ -1681,7 +2313,7 @@ function Start-AgentTerminal {
     # The marker makes future active-session checks exact even when two folders
     # on different drives share the same leaf name.
     $command = '$env:AGENT_LAUNCHER_WORKSPACE = {0}; $Host.UI.RawUI.WindowTitle = {1}; {2}' -f $quotedWork, $quotedTitle, $invoke
-    Start-AgentConsole -Command $command -WorkingDirectory $preview.WorkingDirectory -Title $preview.WindowTitle
+    Start-AgentConsole -Command $command -WorkingDirectory $preview.WorkingDirectory -Title $preview.WindowTitle -TabTitle $SessionTitle
 }
 
 # ---------------------------------------------------------------- handoff ---
@@ -2020,12 +2652,60 @@ function Resolve-HandoffFilePath {
 
 # ------------------------------------------------------- command-line mode ---
 
-if ($Agent -or $Project -or $Context -or $Model -or $Mode -or $Start -or $Prompt -or $Effort -or $Persona -or $Web -or $HandoffFile -or $DryRun) {
+function Import-OrchestratorEntry {
+    if (Get-Command Get-OrchestratorPreview -ErrorAction SilentlyContinue) { return }
+    $entryPath = Join-Path $PSScriptRoot 'OrchestratorEntry.ps1'
+    if (-not (Test-Path -LiteralPath $entryPath -PathType Leaf)) { throw 'The optional Orchestrator adapter module is not installed.' }
+    . $entryPath
+    # Dot-sourcing inside this function keeps functions local to it. Export the
+    # three entry functions into the script scope without loading private paths
+    # or controller configuration for an Ordinary session.
+    foreach ($entryName in @('ConvertTo-OrchestratorArgument','Resolve-OrchestratorAdapterPath','Get-OrchestratorPreview','Test-OrchestratorReadiness','Start-OrchestratorTerminal')) {
+        Set-Item -Path ('Function:script:' + $entryName) -Value (Get-Item ('Function:' + $entryName)).ScriptBlock
+    }
+}
+
+function Import-HerdrEntry {
+    Import-OrchestratorEntry
+    $entryPath = Join-Path $PSScriptRoot 'HerdrEntry.ps1'
+    if (-not (Test-Path -LiteralPath $entryPath -PathType Leaf)) { throw 'The optional Herdr host module is not installed.' }
+    . $entryPath
+    foreach ($entryName in @('Get-HerdrHostPreview','Test-HerdrHostReadiness','Start-HerdrWorkspace','Get-HerdrConsoleCommand')) {
+        Set-Item -Path ('Function:script:' + $entryName) -Value (Get-Item ('Function:' + $entryName)).ScriptBlock
+    }
+}
+
+function Add-TerminalHostPreview {
+    param([Parameter(Mandatory)]$Preview)
+    if ($script:launchTerminalHost -eq 'Herdr') {
+        Import-HerdrEntry
+        $hostPreview = Get-HerdrHostPreview -WorkingDirectory $Preview.WorkingDirectory -AdapterPath $HerdrAdapter -SharedSession:($script:launchTerminalHost -eq 'Herdr')
+        $null = Test-HerdrHostReadiness $hostPreview
+        $Preview | Add-Member -NotePropertyName TerminalHost -NotePropertyValue $hostPreview.TerminalHost
+    }
+    return $Preview
+}
+
+if ($TerminalHost -ne 'Terminal' -or $HerdrAdapter -or $SessionRole -eq 'Orchestrator' -or $OrchestratorAdapter -or $Agent -or $Project -or $Context -or $Model -or $Mode -or $Start -or $Prompt -or $Effort -or $Persona -or $Web -or $HandoffFile -or $DryRun) {
     if (-not $Agent)   { throw 'Direct or dry-run mode requires -Agent.' }
     if (-not $Project) { throw 'Direct or dry-run mode requires -Project.' }
     $workPath = Resolve-WorkspacePath $Project
     $contextPaths = @()
     if ($Context) { $contextPaths = @($Context | ForEach-Object { Resolve-WorkspacePath $_ -AllowAnywhere }) }
+    if ($HerdrAdapter -and $TerminalHost -ne 'Herdr') { throw '-HerdrAdapter requires a Herdr terminal host.' }
+    if ($HandoffFile -and $TerminalHost -eq 'Herdr') { throw 'Launcher handoff automation uses Terminal. Start a new Herdr session instead.' }
+    if ($SessionRole -eq 'Orchestrator') {
+        [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+        Import-OrchestratorEntry
+        $contextPaths = @(Get-OrchestratorContextPaths -ProjectPath $workPath -Attached $contextPaths)
+        $preview = Get-OrchestratorPreview -SelectedAgent $Agent -WorkingDirectory $workPath -AdapterPath $OrchestratorAdapter -Contexts $contextPaths -Model (Get-ModelSlug $Model) -Mode $Mode -Start $Start -Prompt $Prompt -Effort $Effort -Persona $Persona -Web $Web -Handoff $HandoffFile
+        if ($DryRun) {
+            $null = Test-OrchestratorReadiness $preview
+            Add-TerminalHostPreview $preview | ConvertTo-Json -Depth 5
+        } else { $null = Start-OrchestratorTerminal $preview }
+        exit 0
+    }
+    if ($OrchestratorAdapter) { throw '-OrchestratorAdapter requires -SessionRole Orchestrator.' }
     if ($HandoffFile) {
         # The handoff file is the first message, so a prompt of its own has
         # nowhere to go, and a resumed session would already have its history.
@@ -2036,7 +2716,8 @@ if ($Agent -or $Project -or $Context -or $Model -or $Mode -or $Start -or $Prompt
         $Start = $startNewLabel
     }
     if ($DryRun) {
-        Get-LaunchPreview -SelectedAgent $Agent -WorkingDirectory $workPath -ContextDirectories $contextPaths -SelectedModel $Model -SelectedMode $Mode -StartMode $Start -OpeningPrompt $Prompt -SelectedEffort $Effort -SelectedPersona $Persona -SelectedWeb $Web | ConvertTo-Json -Depth 5
+        $preview = Get-LaunchPreview -SelectedAgent $Agent -WorkingDirectory $workPath -ContextDirectories $contextPaths -SelectedModel $Model -SelectedMode $Mode -StartMode $Start -OpeningPrompt $Prompt -SelectedEffort $Effort -SelectedPersona $Persona -SelectedWeb $Web
+        Add-TerminalHostPreview $preview | ConvertTo-Json -Depth 5
         exit 0
     }
     Start-AgentTerminal -SelectedAgent $Agent -WorkingDirectory $workPath -ContextDirectories $contextPaths -SelectedModel $Model -SelectedMode $Mode -StartMode $Start -OpeningPrompt $Prompt -SelectedEffort $Effort -SelectedPersona $Persona -SelectedWeb $Web
@@ -2070,6 +2751,7 @@ $theme = @{
     Border  = [System.Drawing.Color]::FromArgb(48, 54, 61)
     Head    = [System.Drawing.Color]::FromArgb(201, 209, 217)
     Section = [System.Drawing.Color]::FromArgb(88, 166, 255)
+    Claude  = [System.Drawing.Color]::FromArgb(217, 119, 48)
     Label   = [System.Drawing.Color]::FromArgb(139, 148, 158)
     Value   = [System.Drawing.Color]::FromArgb(63, 185, 80)
     Warning = [System.Drawing.Color]::FromArgb(210, 153, 34)
@@ -2118,15 +2800,17 @@ function Set-WindowIcon {
     if ($script:appIcon) { $Window.Icon = $script:appIcon }
 }
 
+try { [void][Launcher.AppIdentity]::Set('VirtualRainbow.AgentProjectLauncher') } catch { }
+
 $form = New-Object Launcher.VerticalResizeForm
 $form.Text            = 'Start an agent session'
 $form.StartPosition   = 'CenterScreen'
 $form.FormBorderStyle = 'Sizable'
 $form.MaximizeBox     = $false
 $form.MinimizeBox     = $true
-$form.ClientSize      = New-Object System.Drawing.Size(820, 504)
+$form.ClientSize      = New-Object System.Drawing.Size(1020, 504)
 $form.MinimumSize     = $form.Size
-$form.MaximumSize     = New-Object System.Drawing.Size($form.Width, [System.Windows.Forms.SystemInformation]::MaxWindowTrackSize.Height)
+$form.MaximumSize     = New-Object System.Drawing.Size([System.Windows.Forms.SystemInformation]::MaxWindowTrackSize.Width, [System.Windows.Forms.SystemInformation]::MaxWindowTrackSize.Height)
 $form.Font            = $fontBase
 $form.BackColor       = $theme.Bg
 $form.ForeColor       = $theme.Head
@@ -2733,9 +3417,9 @@ function Show-ThemedChoice {
 # a rule: where the session runs, what runs it, and how it starts. Labels sit
 # above their control so a row can hold four of them side by side.
 
-$panelW = 788
+$panelW = 988
 $edgeL  = 16
-$edgeR  = 772
+$edgeR  = 972
 
 $uiNewTab  = New-ThemeButton $form 'New session'   16 10 146 $theme.Section 1
 $uiLiveTab = New-ThemeButton $form 'Live sessions' 170 10 162 $theme.Label 1
@@ -2743,7 +3427,7 @@ $uiBrandWordmark = New-RainbowWordmark $form 667 10
 $uiBrandWordmark.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
 
 $panel = New-ThemePanel $form 16 46 $panelW 444 -Bordered
-$panel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$panel.Anchor = [System.Windows.Forms.AnchorStyles]::Top
 
 # Paths and link lists are longer than the row they live on, so the row shows
 # what fits and hovering shows the whole thing. Drawn by hand, because a system
@@ -2838,6 +3522,10 @@ $help = @{
         'Sent as the first message the moment the session opens.',
         'Leave it empty to land on an empty prompt.'
     ) -join "`r`n"
+    Title = @(
+        'A name for this session, shown in Live sessions and as the tab name in Herdr.',
+        'Leave it empty and the launcher names the session after what it is working on.'
+    ) -join "`r`n"
 
     Persona = @(
         'Claude only. Starts the session as a subagent defined in',
@@ -2901,67 +3589,99 @@ function New-ThemeHelpText {
 
 [void](New-ThemeText $panel '# Work folder' $edgeL 16 $theme.Section 300)
 
-$uiProject = New-ThemeCombo $panel $edgeL 44 504
-$uiProjectBrowse = New-ThemeButton $panel 'Browse...' 536 44 124 $theme.Head 1
-$uiProjectRemove = New-ThemeButton $panel 'Remove'    668 44 104 $theme.Head 1
+# Everything runs out to the right edge ($edgeR): the buttons are pushed to the
+# side and the fields take the room they leave.
+$uiProject = New-ThemeCombo $panel $edgeL 44 712
+$uiProjectBrowse = New-ThemeButton $panel 'Browse...' 736 44 124 $theme.Head 1
+$uiProjectRemove = New-ThemeButton $panel 'Remove'    868 44 104 $theme.Head 1
 
-$uiProjectPath = New-ThemeText $panel '' $edgeL 78 $theme.Muted 756
+$uiProjectPath = New-ThemeText $panel '' $edgeL 78 $theme.Muted ($edgeR - $edgeL)
 
-$uiVaultLink = New-ThemeText $panel '' $edgeL 106 $theme.Muted 600
-$uiVaultLinkSet = New-ThemeButton $panel 'Link...' 668 104 104 $theme.Head 1
+$uiVaultLink = New-ThemeText $panel '' $edgeL 106 $theme.Muted 844
+$uiVaultLinkSet = New-ThemeButton $panel 'Link...' 868 104 104 $theme.Head 1
 Set-RowTip $uiVaultLinkSet $help.VaultLink
 
 [void](New-ThemeRule $panel 138)
 [void](New-ThemeText $panel '# Agent configuration' $edgeL 152 $theme.Section 400)
 
-[void](New-ThemeText $panel 'Agent' $edgeL 180 $theme.Label 170)
-$uiAgent = New-ThemeCombo $panel $edgeL 202 176
+# Four columns with an 8px gutter, together exactly as wide as the rules.
+[void](New-ThemeText $panel 'Agent' $edgeL 180 $theme.Label 200)
+$uiAgent = New-ThemeCombo $panel $edgeL 202 200
 [void]$uiAgent.Items.Add('Claude')
 [void]$uiAgent.Items.Add('Codex')
 $uiAgent.SelectedIndex = 0
 
 # A real dropdown list, so clicking anywhere in the box opens it. Typing a model
 # the list does not have is still possible via the 'Other...' entry.
-[void](New-ThemeText $panel 'Model' 196 180 $theme.Label 180)
-$uiModel = New-ThemeCombo $panel 196 202 188
+[void](New-ThemeText $panel 'Model' 224 180 $theme.Label 240)
+$uiModel = New-ThemeCombo $panel 224 202 240
 
 # The '[?]' marks belong to Advanced options; out here the rows are self
 # explanatory, so they carry the hover text without the clutter.
-$uiEffortLabel = New-ThemeText $panel 'Effort' 388 180 $theme.Label 150
+$uiEffortLabel = New-ThemeText $panel 'Effort' 472 180 $theme.Label 200
 Set-RowTip $uiEffortLabel $help.Effort
-$uiEffort = New-ThemeCombo $panel 388 202 152
+$uiEffort = New-ThemeCombo $panel 472 202 200
 Set-RowTip $uiEffort $help.Effort
 
-$uiModeLabel = New-ThemeText $panel 'Permissions' 544 180 $theme.Label 228
+$uiModeLabel = New-ThemeText $panel 'Permissions' 680 180 $theme.Label 292
 Set-RowTip $uiModeLabel $help.Permissions
-$uiMode = New-ThemeCombo $panel 544 202 228
+$uiMode = New-ThemeCombo $panel 680 202 292
 foreach ($choice in $modeChoices) { [void]$uiMode.Items.Add($choice) }
 $uiMode.SelectedItem = $modeDefaultLabel
 Set-RowTip $uiMode $help.Permissions
 
 [void](New-ThemeRule $panel 240)
-$uiSessionHeading = New-ThemeText $panel '# Session' $edgeL 254 $theme.Section 572
+# One row of four, as wide as the rules: role, terminal, start and the first
+# message. Handoff mode reuses the last two slots (see Enter-HandoffMode).
+$uiSessionHeading = New-ThemeText $panel '# Session' $edgeL 254 $theme.Section 180
+$uiRoleNote = New-ThemeText $panel '' 196 254 $theme.Muted 776
+$uiRoleNote.Visible = $false
+$uiRoleLabel = New-ThemeText $panel 'Role' $edgeL 282 $theme.Label 140
+$uiSessionRole = New-ThemeCombo $panel $edgeL 304 140
+[void]$uiSessionRole.Items.Add('Ordinary')
+[void]$uiSessionRole.Items.Add('Orchestrator')
+$uiSessionRole.SelectedIndex = 0
+Set-RowTip $uiRoleLabel 'Ordinary opens the selected CLI normally. Orchestrator delegates project work and runs its managed checks and repairs.'
+Set-RowTip $uiSessionRole 'Ordinary opens the selected CLI normally. Orchestrator delegates project work and runs its managed checks and repairs.'
+[void](New-ThemeText $panel 'Terminal' 164 282 $theme.Label 120)
+$uiTerminalHost = New-ThemeCombo $panel 164 304 120
+[void]$uiTerminalHost.Items.Add('Terminal')
+[void]$uiTerminalHost.Items.Add('Herdr')
+$uiTerminalHost.SelectedItem = $TerminalHost
+Set-RowTip $uiTerminalHost 'Herdr adds projects as Spaces in the same persistent Herdr tab. If the tab is closed, the next launch reopens the shared session. Works with Ordinary or Orchestrator.'
+$uiTerminalHost.Add_SelectedIndexChanged({
+    $script:launchTerminalHost = [string]$uiTerminalHost.SelectedItem
+    Save-LauncherSettings
+})
 
-$uiStartLabel = New-ThemeText $panel 'Start' $edgeL 282 $theme.Label 170
+$uiStartLabel = New-ThemeText $panel 'Start' 292 282 $theme.Label 150
 Set-RowTip $uiStartLabel $help.Start
-$uiStartMode = New-ThemeCombo $panel $edgeL 304 176
+$uiStartMode = New-ThemeCombo $panel 292 304 150
 foreach ($choice in $startChoices) { [void]$uiStartMode.Items.Add($choice) }
 $uiStartMode.SelectedItem = $startNewLabel
 
-$uiPromptLabel = New-ThemeText $panel '' 196 282 $theme.Label 400
+# Left empty, the agent's own title is used. Not offered for Orchestrator or
+# handoff sessions (see Update-Details).
+$uiTitleLabel = New-ThemeText $panel 'Title (optional)' 450 282 $theme.Label 190
+Set-RowTip $uiTitleLabel $help.Title
+$uiSessionTitle = New-ThemeTextBox $panel 450 304 190
+$uiSessionTitle.MaxLength = 80
+Set-RowTip $uiSessionTitle $help.Title
+
+$uiPromptLabel = New-ThemeText $panel '' 650 282 $theme.Label 322
 Set-RowTip $uiPromptLabel $help.Prompt
-$uiPrompt = New-ThemeTextBox $panel 196 304 576
+$uiPrompt = New-ThemeTextBox $panel 650 304 322
 
 # Handoff mode borrows this section: status, timing and an optional note remain
 # visible before the action button. The bottom Cancel button exits this mode.
-$uiHandoffStatus = New-ThemeCombo $panel $edgeL 304 176
+$uiHandoffStatus = New-ThemeCombo $panel 292 304 190
 foreach ($choice in $handoffStatusChoices) { [void]$uiHandoffStatus.Items.Add($choice) }
 $uiHandoffStatus.SelectedIndex = 0
 $uiHandoffStatus.Tag.Visible = $false
 Set-RowTip $uiHandoffStatus $help.HandoffStatus
-$uiHandoffTimingLabel = New-ThemeText $panel 'When?' 196 282 $theme.Label 320
+$uiHandoffTimingLabel = New-ThemeText $panel 'When?' 490 282 $theme.Label 270
 $uiHandoffTimingLabel.Visible = $false
-$uiHandoffTiming = New-ThemeCombo $panel 196 304 320
+$uiHandoffTiming = New-ThemeCombo $panel 490 304 270
 foreach ($choice in @('Hand off now', 'Checkpoint at next safe point', 'Automatic at 85% account use')) {
     [void]$uiHandoffTiming.Items.Add($choice)
 }
@@ -2985,10 +3705,10 @@ $advanced.Visible = $false
 
 # Scope comes first because it changes what the whole session can work on.
 [void](New-ThemeHelpText $advanced 'Also in scope' 15 4 $theme.Label 400 $help.Scope)
-$uiContext = New-ThemeCombo $advanced 15 30 498
-$uiContextAdd = New-ThemeButton $advanced '+ Folder' 529 30 130 $theme.Head 1
+$uiContext = New-ThemeCombo $advanced 15 30 706
+$uiContextAdd = New-ThemeButton $advanced '+ Folder' 729 30 130 $theme.Head 1
 Set-RowTip $uiContextAdd $help.Scope
-$uiContextRemove = New-ThemeButton $advanced 'Remove' 667 30 104 $theme.Head 1
+$uiContextRemove = New-ThemeButton $advanced 'Remove' 867 30 104 $theme.Head 1
 $uiContextPath = New-ThemeText $advanced '' 15 62 $theme.Muted ($edgeR - $edgeL)
 
 $uiPersonaLabel = New-ThemeHelpText $advanced 'Subagent persona' 15 90 $theme.Label 260 $help.Persona
@@ -3002,11 +3722,34 @@ Set-RowTip $uiWeb $help.Web
 
 # ---------------------------------------------------------- live sessions ---
 
-$livePanel = New-ThemePanel $form 16 46 $panelW 380 -Bordered
+$livePanel = New-ThemePanel $form 16 46 $panelW 392 -Bordered
 $livePanel.Visible = $false
 $livePanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$script:liveColumnKeys = @('Agent', 'Project', 'Model', 'Effort', 'Context', 'Permission')
+$script:liveColumnFractions = [ordered]@{ Agent = 0.08; Project = 0.42; Model = 0.13; Effort = 0.08; Context = 0.14; Permission = 0.15 }
+$script:liveColumnWidths = @{}
+$script:liveResizeStart = $null
+$script:liveSplitters = @()
+$script:liveLayoutPath = Get-LauncherDataPath 'live-layout.json'
+if (Test-Path -LiteralPath $script:liveLayoutPath -PathType Leaf) {
+    try {
+        $savedLayout = Get-Content -LiteralPath $script:liveLayoutPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($key in $script:liveColumnKeys) {
+            $value = $savedLayout.PSObject.Properties[$key]
+            if ($value -and [double]$value.Value -gt 0) { $script:liveColumnFractions[$key] = [double]$value.Value }
+        }
+        $savedTitleWidth = $savedLayout.PSObject.Properties['Title']
+        $savedProjectWidth = $savedLayout.PSObject.Properties['Project']
+        if ($savedTitleWidth -and $savedProjectWidth) {
+            $script:liveColumnFractions.Project = [double]$savedTitleWidth.Value + [double]$savedProjectWidth.Value
+        }
+        $fractionTotal = 0.0
+        foreach ($key in $script:liveColumnKeys) { $fractionTotal += [double]$script:liveColumnFractions[$key] }
+        if ($fractionTotal -gt 0) { foreach ($key in $script:liveColumnKeys) { $script:liveColumnFractions[$key] = [double]$script:liveColumnFractions[$key] / $fractionTotal } }
+    } catch { }
+}
 [void](New-ThemeText $livePanel '# Live terminal sessions' $edgeL 16 $theme.Section 400)
-$uiLiveCompact = New-ThemeButton $livePanel 'Compact all' 494 12 146 $theme.Head 1
+$uiLiveCompact = New-ThemeButton $livePanel 'Compact all' 694 12 146 $theme.Head 1
 $uiLiveCompact.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
 Set-RowTip $uiLiveCompact (@(
     'Types /compact into every session in the list, one at a time.',
@@ -3018,30 +3761,92 @@ Set-RowTip $uiLiveCompact (@(
     'A session whose tab cannot be identified with certainty is skipped rather',
     'than guessed at, and named in the summary.'
 ) -join "`r`n")
-$uiLiveRefresh = New-ThemeButton $livePanel 'Refresh' 648 12 124 $theme.Head 1
+$uiLiveRefresh = New-ThemeButton $livePanel 'Refresh' 848 12 124 $theme.Head 1
 $uiLiveRefresh.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
-[void](New-ThemeText $livePanel 'Model, effort, context usage, limits and permissions. Hover for detail, click a session for its actions.' $edgeL 44 $theme.Muted 756)
+# Account limits belong to the account, not to a session, so they are shown once
+# here instead of repeating on every row. Hover either for the reset times.
+$uiLiveClaudeName = New-ThemeText $livePanel '' $edgeL 34 $theme.Claude 70
+$uiLiveClaudeValue = New-ThemeText $livePanel '' ($edgeL + 70) 34 $theme.Value 120
+$uiLiveCodexName = New-ThemeText $livePanel '' $edgeL 51 $theme.Section 70
+$uiLiveCodexValue = New-ThemeText $livePanel '' ($edgeL + 70) 51 $theme.Value 120
 
 # Context carries its own health: green below 60%, amber from 60%, red from 80%.
 # A separate column only restated what the colour already says.
-[void](New-ThemeText $livePanel 'Agent'   16 76 $theme.Label 64)
-[void](New-ThemeText $livePanel 'Project' 94 76 $theme.Label 155)
-[void](New-ThemeText $livePanel 'Model' 256 76 $theme.Label 92)
-[void](New-ThemeText $livePanel 'Effort' 354 76 $theme.Label 58)
-[void](New-ThemeText $livePanel 'Context' 432 76 $theme.Label 115)
-[void](New-ThemeText $livePanel 'Limits' 551 76 $theme.Label 95)
-[void](New-ThemeText $livePanel 'Permissions' 650 76 $theme.Label 100)
-[void](New-ThemeRule $livePanel 102)
+$uiLiveAgentHeader = New-ThemeText $livePanel 'Agent' 16 88 $theme.Label 56
+$uiLiveProjectHeader = New-ThemeText $livePanel 'Project' 82 88 $theme.Label 200
+$uiLiveProjectHeader.Cursor = [System.Windows.Forms.Cursors]::Hand
+$uiLiveProjectHeader.AccessibleName = 'Sort live sessions by project'
+$uiLiveProjectHeader.Text = 'Project (sort)'
+$uiLiveModelHeader = New-ThemeText $livePanel 'Model' 343 88 $theme.Label 74
+$uiLiveEffortHeader = New-ThemeText $livePanel 'Effort' 423 88 $theme.Label 48
+$uiLiveContextHeader = New-ThemeText $livePanel 'Context' 477 88 $theme.Label 88
+$uiLivePermissionHeader = New-ThemeText $livePanel 'Permissions' 641 88 $theme.Label 100
+$uiLiveRule = New-ThemeRule $livePanel 114
+$uiLiveRule.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$script:liveSplitters = @()
+for ($splitIndex = 0; $splitIndex -lt ($script:liveColumnKeys.Count - 1); $splitIndex++) {
+    $splitter = New-Object Launcher.BufferedPanel
+    $splitter.Location = New-Object System.Drawing.Point(0, 84)
+    $splitter.Size = New-Object System.Drawing.Size(7, 24)
+    $splitter.BackColor = $theme.Border
+    $splitter.Cursor = [System.Windows.Forms.Cursors]::VSplit
+    $splitter.Tag = $splitIndex
+    $livePanel.Controls.Add($splitter)
+    $script:liveSplitters += $splitter
+    Set-RowTip $splitter 'Drag to resize the columns on either side.'
+    $splitter.Add_MouseDown({
+        param($sender, $e)
+        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        $index = [int]$sender.Tag
+        $sender.Capture = $true
+        $script:liveResizeStart = @{
+            Index = $index
+            X = [System.Windows.Forms.Cursor]::Position.X
+            LeftWidth = [int]$script:liveColumnWidths[$script:liveColumnKeys[$index]]
+            RightWidth = [int]$script:liveColumnWidths[$script:liveColumnKeys[$index + 1]]
+            PairFraction = [double]$script:liveColumnFractions[$script:liveColumnKeys[$index]] + [double]$script:liveColumnFractions[$script:liveColumnKeys[$index + 1]]
+        }
+    })
+    $splitter.Add_MouseMove({
+        param($sender, $e)
+        if (-not $script:liveResizeStart -or [int]$script:liveResizeStart.Index -ne [int]$sender.Tag) { return }
+        $index = [int]$sender.Tag
+        $leftKey = $script:liveColumnKeys[$index]
+        $rightKey = $script:liveColumnKeys[$index + 1]
+        $available = [Math]::Max(1, $uiLiveRows.ClientSize.Width - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth - (($script:liveColumnKeys.Count - 1) * 10))
+        $delta = [System.Windows.Forms.Cursor]::Position.X - [int]$script:liveResizeStart.X
+        $minimumWidths = @{ Agent = 55; Project = 190; Model = 65; Effort = 45; Context = 75; Permission = 90 }
+        $minimumLeft = [int]$minimumWidths[$leftKey]
+        $minimumRight = [int]$minimumWidths[$rightKey]
+        $newLeftWidth = [int]$script:liveResizeStart.LeftWidth + $delta
+        $newLeftWidth = [Math]::Max($minimumLeft, [Math]::Min(([int]$script:liveResizeStart.LeftWidth + [int]$script:liveResizeStart.RightWidth - $minimumRight), $newLeftWidth))
+        $script:liveColumnFractions[$leftKey] = [double]$newLeftWidth / $available
+        $script:liveColumnFractions[$rightKey] = [double]$script:liveResizeStart.PairFraction - [double]$script:liveColumnFractions[$leftKey]
+        Update-LiveTableLayout
+    })
+    $splitter.Add_MouseUp({
+        param($sender, $e)
+        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left -or -not $script:liveResizeStart) { return }
+        $sender.Capture = $false
+        $script:liveResizeStart = $null
+        try {
+            $layoutDirectory = Split-Path -Parent $script:liveLayoutPath
+            if (-not (Test-Path -LiteralPath $layoutDirectory -PathType Container)) { [void](New-Item -ItemType Directory -Path $layoutDirectory -Force) }
+            $json = ConvertTo-Json -InputObject $script:liveColumnFractions -Depth 4
+            [System.IO.File]::WriteAllText($script:liveLayoutPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+        } catch { }
+    })
+}
 
 $uiLiveRows = New-Object Launcher.BufferedPanel
-$uiLiveRows.Location = New-Object System.Drawing.Point(16, 108)
-$uiLiveRows.Size = New-Object System.Drawing.Size(756, 224)
+$uiLiveRows.Location = New-Object System.Drawing.Point(16, 120)
+$uiLiveRows.Size = New-Object System.Drawing.Size(956, 224)
 $uiLiveRows.BackColor = $theme.Panel
 $uiLiveRows.Font = $fontBase
 $uiLiveRows.AutoScroll = $true
 $uiLiveRows.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $livePanel.Controls.Add($uiLiveRows)
-$uiLiveSummary = New-ThemeText $livePanel '' 16 342 $theme.Muted 620
+$uiLiveSummary = New-ThemeText $livePanel '' 16 354 $theme.Muted 620
 $uiLiveSummary.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
 
 $script:panelHeightCollapsed = 380
@@ -3055,9 +3860,8 @@ $script:buttonGap    = 16
 $script:buttonHeight = 26
 $script:buttonPad    = 36
 
-# Start and Cancel are anchored to the bottom edge, so the form has to be
-# resized before they are moved: setting Top first and growing the form after
-# applies the height change twice and drops them below the visible area.
+# Keep the action row at a fixed distance below the session panel. The form is
+# sized to fit it when the panel changes; later window resizing leaves it put.
 function Set-ButtonRow {
     param([int]$PanelTop, [int]$PanelHeight, [int]$MinPanelHeight = 0, [switch]$Exact)
     if ($MinPanelHeight -le 0) { $MinPanelHeight = $PanelHeight }
@@ -3103,9 +3907,16 @@ $uiStart  = New-ThemeButton $form 'Open terminal' 526 442 170 $theme.Section 1
 $uiCancel = New-ThemeButton $form 'Cancel' 704 442 100 $theme.Label 1
 $uiHandoffCancel = New-ThemeButton $form 'Cancel handoff' 630 442 174 $theme.Label 1
 $uiHandoffCancel.Visible = $false
-$uiStart.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
-$uiCancel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
-$uiHandoffCancel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+$uiStart.Anchor = [System.Windows.Forms.AnchorStyles]::Top
+$uiCancel.Anchor = [System.Windows.Forms.AnchorStyles]::Top
+$uiHandoffCancel.Anchor = [System.Windows.Forms.AnchorStyles]::Top
+# The action buttons sit against the panel's right edge, Cancel outermost.
+function Set-ActionButtonPositions {
+    $right = $panel.Left + $panel.Width
+    $outer = if ($script:handoffSource) { $uiHandoffCancel } else { $uiCancel }
+    $outer.Left = $right - $outer.Width
+    $uiStart.Left = $outer.Left - 8 - $uiStart.Width
+}
 $uiCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 $form.AcceptButton = $uiStart
 $form.CancelButton = $uiCancel
@@ -3122,10 +3933,9 @@ $form.Add_Shown({
     # avoids their temporary white system-theme rectangles on the first frame.
     $form.Refresh()
     $form.Opacity = 1
-    # Come to the front. The shortcut starts powershell with -WindowStyle
-    # Hidden to keep its console out of the way, and WinForms takes that as
-    # the show state for the first window it creates: the form is built and
-    # made visible but never raised, so it opens behind whatever is already
+    # Come to the front. PowerShell starts with its console hidden, and WinForms
+    # takes that as the show state for the first window it creates: the form is
+    # built and made visible but never raised, so it opens behind whatever is
     # on screen. On an empty desktop that goes unnoticed; with anything
     # maximised in front it looks exactly like a launcher that never opened.
     $raised = $false
@@ -3136,7 +3946,7 @@ $form.Add_Shown({
         # it goes on only long enough to lift this one to the top.
         $form.TopMost = $true
         $form.TopMost = $false
-        $form.Activate()
+        [void]$form.Activate()
     }
     $uiStart.Focus()
 })
@@ -3167,6 +3977,8 @@ $script:savedProjects  = @($loaded.SavedProjects)
 
 $script:lastAgent      = [string]$loaded.LastAgent
 $script:lastProject    = [string]$loaded.LastProject
+$script:lastSessionRole = if ($loaded.LastSessionRole -in @('Ordinary','Orchestrator')) { [string]$loaded.LastSessionRole } else { 'Ordinary' }
+$script:suspendSessionPreference = $false
 $script:projectContexts = $loaded.ProjectContexts
 $script:currentProject  = ''
 $script:agentModels     = $loaded.AgentModels
@@ -3418,6 +4230,7 @@ function Get-SelectedProjectPath {
 }
 
 $script:liveSessions = @()
+$script:liveProjectSortDescending = $null
 $script:launcherView = 'new'
 
 function Test-LiveSessionProject {
@@ -3748,6 +4561,20 @@ function Invoke-TabAgent {
 # re-reading the foreground rather than on having asked for it.
 function Send-SessionCommand {
     param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][string]$Command, [int]$SettleMilliseconds = 250)
+    # A Herdr pane is not a Windows Terminal tab, but Herdr can type into it:
+    # the text goes in as typed, then Enter. There is no window to bring
+    # forward, so the foreground checks of the tab route do not apply.
+    if ($Session.PSObject.Properties['TerminalHost'] -and $Session.TerminalHost -eq 'Herdr') {
+        if (-not $Session.HerdrPane -or -not $Session.HerdrExe) { return 'privateherdr' }
+        $typed = Invoke-HerdrJson -Exe $Session.HerdrExe -Session $Session.HerdrSession -EnvKey $Session.HerdrEnvKey -AcceptEmpty `
+            -Arguments @('pane', 'send-text', [string]$Session.HerdrPane, $Command)
+        if (-not $typed -or -not $typed.PSObject.Properties['result']) { return 'failed' }
+        Start-Sleep -Milliseconds ([math]::Max(150, $SettleMilliseconds))
+        $entered = Invoke-HerdrJson -Exe $Session.HerdrExe -Session $Session.HerdrSession -EnvKey $Session.HerdrEnvKey -AcceptEmpty `
+            -Arguments @('pane', 'send-keys', [string]$Session.HerdrPane, 'Enter')
+        if (-not $entered -or -not $entered.PSObject.Properties['result']) { return 'failed' }
+        return 'sent'
+    }
     return (Invoke-TabAgent -Session $Session -Command $Command -SettleMilliseconds $SettleMilliseconds)
 }
 
@@ -3758,16 +4585,50 @@ function Get-TabAgentReason {
     switch ($Status) {
         'ambiguous' { 'two tabs look identical' }
         'notfound'  { 'tab not found' }
+        'privateherdr' { 'it runs in a private Herdr server the launcher cannot reach, so switch to it in Herdr yourself' }
         'focus'     { 'window would not come forward' }
         'moved'     { 'focus moved away mid-command, left unsent' }
         default     { 'the tab helper did not answer' }
     }
 }
 
+# A title the user typed always wins. Otherwise show what the transcript says
+# the session is about; the start time is only a stand-in for a session that
+# has not been given a prompt yet.
+function Get-SessionTitle {
+    param($Session)
+    $given = Get-UserSessionTitle $Session
+    if ($given) { return $given }
+    if ($Session.AutoTitle) { return [string]$Session.AutoTitle }
+    return 'New session {0}' -f ([datetime]$Session.Started).ToString('HH:mm')
+}
+
+# A session the launcher started carries a short marker in its terminal title,
+# which is how a title typed in New session finds its way to the live row.
+function Get-UserSessionTitle {
+    param($Session)
+    if ($Session.SessionKey -and $script:sessionTitles.ContainsKey([string]$Session.SessionKey)) {
+        return [string]$script:sessionTitles[[string]$Session.SessionKey]
+    }
+    if ([string]$Session.WindowTitle -match '#([0-9a-f]{6})\s*$') {
+        $markerKey = 'marker:' + $Matches[1]
+        if ($script:sessionTitles.ContainsKey($markerKey)) { return [string]$script:sessionTitles[$markerKey] }
+    }
+    return ''
+}
+
+function Get-SessionTitleSource {
+    param($Session)
+    if ($Session.SessionKey -and $script:sessionTitles.ContainsKey([string]$Session.SessionKey)) { return 'set by you with Set session title' }
+    if (Get-UserSessionTitle $Session) { return 'given by you when the session was started' }
+    if ($Session.AutoTitle) { return 'taken from {0}; set your own with Set session title' -f $Session.AutoTitleSource }
+    return 'no prompt has been written to this session yet'
+}
+
 function Get-SessionName {
     param($Session)
-    if ($Session.Project) { return [string]$Session.Project }
-    return '(unknown)'
+    $project = if ($Session.Project) { [string]$Session.Project } else { '(unknown)' }
+    return '{0} - {1}' -f $project, (Get-SessionTitle $Session)
 }
 
 # Clicking a row opens this. Going to a session types nothing at all: the tab is
@@ -3787,6 +4648,8 @@ $script:menuHeader.Enabled = $false
 [void]$script:sessionMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $script:menuGo = $script:sessionMenu.Items.Add('Go to this session')
 $script:menuGo.ForeColor = $theme.Head
+$script:menuRename = $script:sessionMenu.Items.Add('Set session title...')
+$script:menuRename.ForeColor = $theme.Head
 $script:menuCompact = $script:sessionMenu.Items.Add('Compact this session')
 $script:menuCompact.ForeColor = $theme.Head
 # Nothing is typed anywhere yet: this only opens the handoff in the New session
@@ -3808,6 +4671,22 @@ function Show-SessionMenu {
     $script:menuManualPlanned.Visible = $hasPlan
     $script:sessionMenu.Show([System.Windows.Forms.Cursor]::Position)
 }
+
+$script:menuRename.Add_Click({
+    $session = $script:menuSession
+    if (-not $session) { return }
+    $current = Get-SessionTitle $session
+    $title = [Microsoft.VisualBasic.Interaction]::InputBox('Enter a short title for this live session.', 'Session title', $current)
+    if ([string]::IsNullOrWhiteSpace($title)) { return }
+    $title = $title.Trim()
+    if ($title.Length -gt 80) { $title = $title.Substring(0, 80).TrimEnd() }
+    $script:sessionTitles[[string]$session.SessionKey] = $title
+    $saveError = Save-SessionTitles
+    if ($saveError) {
+        [void][System.Windows.Forms.MessageBox]::Show($form, ('Could not save session titles: ' + $saveError), 'Session title')
+    }
+    Refresh-LiveSessions
+})
 
 function Test-HandoffStatusReady {
     param([AllowEmptyString()][string]$Text)
@@ -3863,7 +4742,7 @@ $script:menuGo.Add_Click({
     $name = Get-SessionName $session
     $uiLiveSummary.Text = 'Bringing {0} to the front...' -f $name
     [System.Windows.Forms.Application]::DoEvents()
-    $status = Invoke-TabAgent -Session $session
+    $status = if ($session.TerminalHost -eq 'Herdr') { Invoke-HerdrGoTo -Session $session } else { Invoke-TabAgent -Session $session }
     if ($status -eq 'shown') {
         $uiLiveSummary.Text = '{0} is in front with the caret in its prompt.' -f $name
     } else {
@@ -3961,6 +4840,103 @@ function Show-LiveSessionTerminal {
     }
 }
 
+function Update-LiveTableLayout {
+    if (-not $uiLiveRows -or -not $uiLiveProjectHeader) { return }
+    $rowWidth = [Math]::Max(0, $uiLiveRows.ClientSize.Width -
+        [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth)
+    $gap = 10
+    $availableWidth = [Math]::Max(1, $rowWidth - (($script:liveColumnKeys.Count - 1) * $gap))
+    $widths = @{}
+    $usedWidth = 0
+    for ($i = 0; $i -lt $script:liveColumnKeys.Count; $i++) {
+        $key = $script:liveColumnKeys[$i]
+        if ($i -eq $script:liveColumnKeys.Count - 1) {
+            $widths[$key] = [Math]::Max(1, $availableWidth - $usedWidth)
+        } else {
+            $widths[$key] = [int][Math]::Floor($availableWidth * [double]$script:liveColumnFractions[$key])
+            $usedWidth += $widths[$key]
+        }
+    }
+    $positions = @{}
+    $x = 0
+    foreach ($key in $script:liveColumnKeys) {
+        $positions[$key] = $x
+        $x += $widths[$key] + $gap
+    }
+    $script:liveColumnWidths = $widths
+    $headerMap = @{
+        Agent = $uiLiveAgentHeader; Project = $uiLiveProjectHeader
+        Model = $uiLiveModelHeader; Effort = $uiLiveEffortHeader; Context = $uiLiveContextHeader
+        Permission = $uiLivePermissionHeader
+    }
+    foreach ($key in $script:liveColumnKeys) {
+        $headerMap[$key].Left = 16 + $positions[$key]
+        $headerMap[$key].Width = $widths[$key]
+    }
+    $uiLiveRule.Width = [Math]::Max(1, $livePanel.ClientSize.Width - 32)
+    for ($i = 0; $i -lt $script:liveSplitters.Count; $i++) {
+        $key = $script:liveColumnKeys[$i]
+        $splitter = $script:liveSplitters[$i]
+        $splitter.Left = 16 + $positions[$key] + $widths[$key] - [int][Math]::Floor($splitter.Width / 2)
+    }
+    foreach ($row in @($uiLiveRows.Controls | Where-Object { $_.Tag -and $_.Tag -isnot [string] })) {
+        $row.Width = $rowWidth
+        foreach ($control in $row.Controls) {
+            switch ([string]$control.Tag) {
+                'agent' { $control.Left = $positions.Agent; $control.Width = $widths.Agent }
+                'project' { $control.Left = $positions.Project; $control.Width = $widths.Project }
+                'model' { $control.Left = $positions.Model; $control.Width = $widths.Model }
+                'effort' { $control.Left = $positions.Effort; $control.Width = $widths.Effort }
+                'context' { $control.Left = $positions.Context; $control.Width = $widths.Context }
+                'permission' { $control.Left = $positions.Permission; $control.Width = $widths.Permission }
+            }
+        }
+    }
+}
+
+# Every live session of one agent carries the same account reading, so the
+# first one stands for the agent. An agent with no live session is left out
+# rather than shown with a stale number.
+function Update-LiveLimits {
+    # One line per agent, the numbers lined up in a column of their own.
+    $top = 34
+    $nameWidth = [System.Windows.Forms.TextRenderer]::MeasureText('Claude:', $uiLiveClaudeName.Font).Width + 6
+    foreach ($entry in @(
+        @{ Agent = 'Claude'; Name = $uiLiveClaudeName; Value = $uiLiveClaudeValue },
+        @{ Agent = 'Codex'; Name = $uiLiveCodexName; Value = $uiLiveCodexValue }
+    )) {
+        $session = @($script:liveSessions | Where-Object { $_.Agent -eq $entry.Agent }) | Select-Object -First 1
+        if (-not $session) {
+            $entry.Name.Text = ''
+            $entry.Value.Text = ''
+            Set-RowTip $entry.Name ''
+            Set-RowTip $entry.Value ''
+            continue
+        }
+        # The name keeps the agent's colour; the number carries the health:
+        # green below 60%, amber from 60%, red from 80%, by the higher window.
+        $valueColor = $theme.Muted
+        $limitMatch = [regex]::Match([string]$session.UsageDisplay, '^\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)%')
+        if ($limitMatch.Success) {
+            $valueColor = $theme.Value
+            $highestUse = [Math]::Max([double]$limitMatch.Groups[1].Value, [double]$limitMatch.Groups[2].Value)
+            if ($highestUse -ge 80) { $valueColor = $theme.Danger }
+            elseif ($highestUse -ge 60) { $valueColor = $theme.Warning }
+        }
+        $entry.Name.Text = '{0}:' -f $entry.Agent
+        $entry.Name.Top = $top
+        $entry.Name.Width = $nameWidth
+        $entry.Value.Text = [string]$session.UsageDisplay
+        $entry.Value.ForeColor = $valueColor
+        $entry.Value.Top = $top
+        $entry.Value.Left = $edgeL + $nameWidth
+        $top += 17
+        $tip = '{0} account limits: 5-hour window / 7-day window.{1}{1}{2}{1}{1}Green below 60%, amber from 60%, red from 80%.' -f $entry.Agent, "`r`n", $session.UsageDetail
+        Set-RowTip $entry.Name $tip
+        Set-RowTip $entry.Value $tip
+    }
+}
+
 function Refresh-LiveSessions {
     param([switch]$RefreshAccountUsage)
     if ($RefreshAccountUsage) {
@@ -3968,6 +4944,19 @@ function Refresh-LiveSessions {
         [System.Windows.Forms.Application]::DoEvents()
     }
     $script:liveSessions = @(Get-LiveAgentSessions)
+    # A title the user gave a session also goes on its Herdr tab, once.
+    foreach ($liveSession in $script:liveSessions) {
+        if ($liveSession.TerminalHost -ne 'Herdr' -or -not $liveSession.HerdrPane) { continue }
+        $givenTitle = Get-UserSessionTitle $liveSession
+        if (-not $givenTitle) { continue }
+        $appliedKey = '{0}|{1}|{2}' -f $liveSession.HerdrSession, $liveSession.HerdrPane, $givenTitle
+        if ($script:herdrTitleApplied.ContainsKey($appliedKey)) { continue }
+        $script:herdrTitleApplied[$appliedKey] = $true
+        [void](Set-HerdrTabTitle -Exe $liveSession.HerdrExe -Session $liveSession.HerdrSession -EnvKey $liveSession.HerdrEnvKey -PaneId $liveSession.HerdrPane -Title $givenTitle)
+    }
+    if ($script:liveProjectSortDescending -ne $null) {
+        $script:liveSessions = @($script:liveSessions | Sort-Object @{Expression={ [string]$_.Project }; Descending=[bool]$script:liveProjectSortDescending}, @{Expression='Started';Descending=$true})
+    }
     if ($RefreshAccountUsage -and @($script:liveSessions | Where-Object { $_.Agent -eq 'Claude' }).Count -gt 0) {
         $freshClaudeUsage = Get-ClaudeAccountUsage
         if ($freshClaudeUsage) { $script:claudeAccountUsage = $freshClaudeUsage }
@@ -3999,6 +4988,7 @@ function Refresh-LiveSessions {
         # one, and the panel would try to scroll sideways.
         $rowWidth = [Math]::Max(0, $uiLiveRows.ClientSize.Width -
             [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth)
+        Update-LiveTableLayout
         foreach ($session in $script:liveSessions) {
             # A panel per row, so the whole line is one click target and can
             # light up under the pointer. The labels sit inside it.
@@ -4011,14 +5001,21 @@ function Refresh-LiveSessions {
             $uiLiveRows.Controls.Add($row)
 
             $y = 4
-            $agentLabel = New-ThemeText $row $session.Agent 0 $y $theme.Head 64 $fontBase
+            $agentColor = switch ($session.Agent) {
+                'Claude' { $theme.Claude }
+                'Codex'  { $theme.Section }
+                default  { $theme.Head }
+            }
+            $agentLabel = New-ThemeText $row $session.Agent 0 $y $agentColor 56 $fontBase
             $projectText = if ($session.Project) { $session.Project } else { '(unknown)' }
             if ($script:plannedHandoffs.ContainsKey([string]$session.AgentId)) { $projectText += '  [planned]' }
-            $projectLabel = New-ThemeText $row $projectText 78 $y $theme.Head 155 $fontBase
-            $modelLabel = New-ThemeText $row $session.Model 240 $y $theme.Value 92 $fontBase
+            $sessionTitle = Get-SessionTitle $session
+            $projectDisplay = '{0} - {1}' -f $projectText, $sessionTitle
+            $projectLabel = New-ThemeText $row $projectDisplay 66 $y $theme.Head 320 $fontBase
+            $modelLabel = New-ThemeText $row $session.Model 396 $y $theme.Value 80 $fontBase
             Set-RowTip $modelLabel ('{0} ({1})' -f $session.ModelDetail, $session.ModelSource)
             $effortColor = if ($session.Effort -eq 'default') { $theme.Muted } else { $theme.Value }
-            $effortLabel = New-ThemeText $row $session.Effort 338 $y $effortColor 58 $fontBase
+            $effortLabel = New-ThemeText $row $session.Effort 486 $y $effortColor 52 $fontBase
             Set-RowTip $effortLabel ('Reasoning effort: {0} ({1})' -f $session.Effort, $session.EffortSource)
             # The health reading is the colour of the number now, not a word in a
             # column of its own.
@@ -4028,7 +5025,7 @@ function Refresh-LiveSessions {
                 'OK'      { $theme.Value }
                 default   { $theme.Muted }
             }
-            $contextLabel = New-ThemeText $row $session.ContextDisplay 416 $y $contextColor 115 $fontBase
+            $contextLabel = New-ThemeText $row $session.ContextDisplay 548 $y $contextColor 100 $fontBase
             $contextTip = if ($session.ContextTokens -gt 0 -and $session.ContextWindow -gt 0) {
                 '{0:N0} of {1:N0} tokens currently used.{2}{2}Green below 60%, amber from 60%, red from 80%.' -f
                     $session.ContextTokens, $session.ContextWindow, "`r`n"
@@ -4038,17 +5035,23 @@ function Refresh-LiveSessions {
                 '{0} has not written a token measurement yet. It normally appears after the first completed turn; then click Refresh.' -f $session.Agent
             }
             Set-RowTip $contextLabel $contextTip
-            $usageLabel = New-ThemeText $row $session.UsageDisplay 535 $y $theme.Head 95 $fontBase
-            Set-RowTip $usageLabel $session.UsageDetail
             # Keep the right edge inside the viewport even when the vertical
             # scrollbar is present; horizontal scrolling is never needed here.
-            $permissionLabel = New-ThemeText $row $session.Permission 634 $y $theme.Head 100 $fontBase
+            $permissionLabel = New-ThemeText $row $session.Permission 741 $y $theme.Head 120 $fontBase
+            $agentLabel.Tag = 'agent'
+            $projectLabel.Tag = 'project'
+            $modelLabel.Tag = 'model'
+            $effortLabel.Tag = 'effort'
+            $contextLabel.Tag = 'context'
+            $permissionLabel.Tag = 'permission'
             Set-RowTip $permissionLabel ('Launch permission mode: ' + $session.Permission)
             $projectDetails = @()
+            $projectDetails += ('Title {0}.' -f (Get-SessionTitleSource $session))
+            $projectDetails += ('Running in {0}' -f $session.TerminalHost)
             if ($session.Workspace) { $projectDetails += $session.Workspace }
             $projectDetails += ('Started {0:g}' -f $session.Started)
             $projectDetails += ('Agent PID {0}; terminal PID {1}' -f $session.AgentId, $session.TerminalId)
-            Set-RowTip $projectLabel ($projectDetails -join "`r`n")
+            Set-RowTip $projectLabel ((@($projectDisplay) + $projectDetails) -join "`r`n")
 
             # Every label as well as the row itself, or the pointer falls
             # through the gaps between them. Which row is being pointed at comes
@@ -4058,6 +5061,7 @@ function Refresh-LiveSessions {
                 $target.Add_MouseLeave($script:rowLeave)
                 $target.Add_Click($script:rowClick)
             }
+            Update-LiveTableLayout
 
             $rowIndex++
         }
@@ -4067,11 +5071,29 @@ function Refresh-LiveSessions {
     $uiLiveRows.HorizontalScroll.Enabled = $false
     $uiLiveRows.HorizontalScroll.Visible = $false
     $uiLiveRows.ResumeLayout()
+    Update-LiveLimits
     $uiLiveSummary.Text = if ($script:liveSessions.Count -eq 1) { '1 live terminal session' } else {
         '{0} live terminal sessions' -f $script:liveSessions.Count
     }
     Set-ThemeButtonAvailable $uiLiveCompact ($script:liveSessions.Count -gt 0)
 }
+
+$uiLiveProjectHeader.Add_Click({
+    if ($null -eq $script:liveProjectSortDescending) {
+        $script:liveProjectSortDescending = $false
+    } else {
+        $script:liveProjectSortDescending = -not [bool]$script:liveProjectSortDescending
+    }
+    $uiLiveProjectHeader.Text = if ($script:liveProjectSortDescending) { 'Project (Z-A)' } else { 'Project (A-Z)' }
+    Refresh-LiveSessions
+})
+$form.Add_Resize({
+    $panel.Left = [Math]::Max(16, [int][Math]::Floor(($form.ClientSize.Width - $panel.Width) / 2))
+    Set-ActionButtonPositions
+    if ($uiLiveRows -and $uiLiveRows.IsHandleCreated) { Update-LiveTableLayout }
+})
+$panel.Left = [Math]::Max(16, [int][Math]::Floor(($form.ClientSize.Width - $panel.Width) / 2))
+Set-ActionButtonPositions
 
 # '/compact' is typed into each session in turn. Both CLIs accept it, and both
 # take it as an ordinary prompt line, so a session that is mid-answer queues it
@@ -4088,9 +5110,10 @@ function Invoke-CompactAllSessions {
         ''
     ) + $lines + @(
         '',
-        'Each terminal is brought to the front in turn, so leave the mouse and',
-        'keyboard alone until it finishes. Anything already typed but unsent in a',
-        'session gets sent along with the command.'
+        'Windows Terminal tabs are brought to the front in turn, so leave the mouse',
+        'and keyboard alone until it finishes. Herdr panes are typed into where they',
+        'are. Anything already typed but unsent in a session gets sent along with',
+        'the command.'
     )
     $answer = [System.Windows.Forms.MessageBox]::Show(
         $form, ($question -join "`r`n"), 'Compact all live sessions',
@@ -4144,6 +5167,10 @@ function Set-LauncherView {
     $panel.Visible = -not $showLive
     $livePanel.Visible = $showLive
     $uiStart.Visible = -not $showLive
+    # A handoff has its own Cancel. The ordinary one closes the launcher, and
+    # showing both stacked them on top of each other.
+    $uiCancel.Visible = (-not $showLive) -and (-not $script:handoffSource)
+    $uiHandoffCancel.Visible = (-not $showLive) -and [bool]$script:handoffSource
 
     $newInk = if ($showLive) { $theme.Label } else { $theme.Section }
     $liveInk = if ($showLive) { $theme.Section } else { $theme.Label }
@@ -4158,10 +5185,13 @@ function Set-LauncherView {
         Refresh-LiveSessions -RefreshAccountUsage
         Set-ButtonRow -PanelTop $livePanel.Top -PanelHeight $livePanel.Height -MinPanelHeight $script:livePanelHeightMin
         $form.AcceptButton = $uiLiveRefresh
+        $form.CancelButton = $null
         $uiLiveRefresh.Focus()
     } else {
         $form.AcceptButton = $uiStart
+        $form.CancelButton = if ($script:handoffSource) { $uiHandoffCancel } else { $uiCancel }
         Update-Layout
+        Set-ActionButtonPositions
         $uiStart.Focus()
     }
 }
@@ -4175,7 +5205,7 @@ function Update-Details {
         Exit-HandoffMode
         return
     }
-    $uiProjectRemove.Enabled = [bool]$workPath
+    Set-ThemeButtonAvailable $uiProjectRemove ([bool]$workPath -and -not $script:handoffSource)
 
     $attached = @(Get-AttachedContextPaths | Where-Object { -not (Test-SamePath $_ $workPath) })
     if ($attached.Count -eq 0) {
@@ -4223,15 +5253,18 @@ function Update-Details {
     # Codex resume takes [SESSION_ID] [PROMPT]; a bare prompt would bind to the
     # session id, so the box is unavailable for that combination.
     # A handoff always starts a new session, whatever the hidden Start box says.
-    $resuming = (-not $script:handoffSource) -and ([string]$uiStartMode.SelectedItem -ne $startNewLabel)
+    $resuming = ([string]$uiSessionRole.SelectedItem -ne 'Orchestrator') -and (-not $script:handoffSource) -and ([string]$uiStartMode.SelectedItem -ne $startNewLabel)
     $promptBlocked = $resuming -and ([string]$uiAgent.SelectedItem -eq 'Codex')
     # ReadOnly rather than disabled: a disabled TextBox repaints itself in the
     # system grey and ignores BackColor, which would punch a light hole in the row.
     $uiPrompt.ReadOnly = $promptBlocked
     $uiPrompt.ForeColor = if ($promptBlocked) { $theme.Muted } else { $theme.Value }
     $uiPromptLabel.Text = if ($script:handoffSource) { 'Note (optional)' }
-        elseif ($promptBlocked) { 'First message (not available when resuming Codex)' }
+        elseif ($promptBlocked) { 'First message (n/a when resuming)' }
         else { 'First message (optional)' }
+    $titleAvailable = ([string]$uiSessionRole.SelectedItem -ne 'Orchestrator') -and (-not $script:handoffSource)
+    $uiTitleLabel.Visible = $titleAvailable
+    $uiSessionTitle.Parent.Visible = $titleAvailable
 
     # The persona label keeps its help marker and a fixed width, so the state
     # that used to be in brackets after it goes into the hover text instead.
@@ -4254,28 +5287,42 @@ function Update-Details {
     # would do nothing at all. Say so rather than letting it look effective.
     if ($readOnly) { $uiContextPath.Text = 'nothing is writable in a read-only session' }
     $uiModel.Enabled = ($uiAgent.SelectedIndex -ge 0)
+    if ([string]$uiSessionRole.SelectedItem -eq 'Orchestrator') {
+        foreach ($control in @($uiMode, $uiPersona, $uiWeb, $advanced)) { $control.Enabled = $false }
+        $uiStartMode.Enabled = $true
+        $uiProjectPath.Text = 'Orchestrator project: ' + $workPath
+        $uiPromptLabel.Text = 'Goal (optional)'
+        $uiRoleNote.Text = 'Delegation, tests and automatic repair'
+        Set-RowTip $uiRoleNote 'The selected Claude/Codex model opens as Orchestrator. The controller prepares an isolated project workspace and manages worker checks and repairs. No automatic main merge or deployment.'
+    }
+    if (-not $script:handoffSource) {
+        $uiStart.Text = if ([string]$uiSessionRole.SelectedItem -eq 'Orchestrator') { '[ Orchestrator ]' } else { '[ Ordinary ]' }
+    }
 }
 
 function Get-ManualHandoffStatus {
-    param([Parameter(Mandatory)]$Handoff)
+    param([Parameter(Mandatory)]$Handoff, [string]$Reason = '')
     $dialog = New-Object System.Windows.Forms.Form
     $dialog.Text = 'Handoff status'
     $dialog.StartPosition = 'CenterParent'
-    $dialog.Size = New-Object System.Drawing.Size(720, 560)
+    $dialog.Size = New-Object System.Drawing.Size(720, 600)
     $dialog.BackColor = $theme.Panel
     $dialog.ForeColor = $theme.Head
     $dialog.Font = $fontBase
     $label = New-Object System.Windows.Forms.Label
-    $label.Text = 'Write a short status for the receiving agent. Use the headings below.'
+    # The receiving agent gets this note and nothing of the old conversation,
+    # so it has to carry the task itself.
+    $why = if ($Reason) { 'The source session could not write this itself: {0}.' -f $Reason } else { 'You chose to write this yourself.' }
+    $label.Text = ("This is the briefing the receiving agent starts from. It does not see the old conversation, so say what task it takes over: the goal, what is done, what is in progress and what to do next.`r`n`r`n" + $why)
     $label.Location = New-Object System.Drawing.Point(16, 16)
-    $label.Size = New-Object System.Drawing.Size(670, 28)
+    $label.Size = New-Object System.Drawing.Size(670, 108)
     $dialog.Controls.Add($label)
     $box = New-Object System.Windows.Forms.TextBox
     $box.Multiline = $true
     $box.ScrollBars = 'Vertical'
     $box.AcceptsReturn = $true
-    $box.Location = New-Object System.Drawing.Point(16, 52)
-    $box.Size = New-Object System.Drawing.Size(670, 410)
+    $box.Location = New-Object System.Drawing.Point(16, 132)
+    $box.Size = New-Object System.Drawing.Size(670, 350)
     $box.BackColor = $theme.Field
     $box.ForeColor = $theme.Value
     $box.Text = Get-HandoffStatusTemplate
@@ -4283,17 +5330,24 @@ function Get-ManualHandoffStatus {
     $ok = New-Object System.Windows.Forms.Button
     $ok.Text = 'Use status'
     $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $ok.Location = New-Object System.Drawing.Point(490, 478)
+    $ok.Location = New-Object System.Drawing.Point(490, 496)
     $ok.Size = New-Object System.Drawing.Size(95, 30)
     $dialog.Controls.Add($ok)
     $cancel = New-Object System.Windows.Forms.Button
     $cancel.Text = 'Cancel'
     $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $cancel.Location = New-Object System.Drawing.Point(591, 478)
+    $cancel.Location = New-Object System.Drawing.Point(591, 496)
     $cancel.Size = New-Object System.Drawing.Size(95, 30)
     $dialog.Controls.Add($cancel)
     $dialog.AcceptButton = $ok
     $dialog.CancelButton = $cancel
+    # A multi-line box opens with everything selected, and the first key typed
+    # would replace all six headings. Put the caret under the first one.
+    $dialog.Add_Shown({
+        $firstBreak = $box.Text.IndexOf("`n")
+        $box.Select($(if ($firstBreak -ge 0) { $firstBreak + 1 } else { 0 }), 0)
+        $box.Focus()
+    })
     $result = $dialog.ShowDialog($form)
     if ($result -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
     return [string]$box.Text
@@ -4358,11 +5412,19 @@ function Complete-PlannedHandoff {
         [Parameter(Mandatory)][string]$StatusText)
     if ($script:plannedHandoffs.ContainsKey([string]$Plan.Source.AgentId) -eq $false) { return }
     Complete-HandoffFile -Handoff $Plan.Handoff -StatusSource $StatusSource -StatusText $StatusText
-    Start-AgentTerminal -SelectedAgent $Plan.TargetAgent -WorkingDirectory $Plan.Handoff.WorkingDirectory `
-        -ContextDirectories $Plan.Contexts -SelectedModel $Plan.TargetModel -SelectedMode $Plan.TargetMode `
-        -StartMode $startNewLabel -OpeningPrompt (Get-HandoffPrompt -HandoffPath $Plan.Handoff.Path `
-            -WorkingDirectory $Plan.Handoff.WorkingDirectory) -SelectedEffort $Plan.TargetEffort `
-        -SelectedPersona $Plan.TargetPersona -SelectedWeb $Plan.TargetWeb
+    # The plan was made some time ago; open the recipient where it was asked to
+    # open, whatever the Terminal box says now.
+    $currentHost = $script:launchTerminalHost
+    if ($Plan.PSObject.Properties['TargetHost'] -and $Plan.TargetHost) { $script:launchTerminalHost = [string]$Plan.TargetHost }
+    try {
+        Start-AgentTerminal -SelectedAgent $Plan.TargetAgent -WorkingDirectory $Plan.Handoff.WorkingDirectory `
+            -ContextDirectories $Plan.Contexts -SelectedModel $Plan.TargetModel -SelectedMode $Plan.TargetMode `
+            -StartMode $startNewLabel -OpeningPrompt (Get-HandoffPrompt -HandoffPath $Plan.Handoff.Path `
+                -WorkingDirectory $Plan.Handoff.WorkingDirectory) -SelectedEffort $Plan.TargetEffort `
+            -SelectedPersona $Plan.TargetPersona -SelectedWeb $Plan.TargetWeb
+    } finally {
+        $script:launchTerminalHost = $currentHost
+    }
     [void]$script:plannedHandoffs.Remove([string]$Plan.Source.AgentId)
     $uiLiveSummary.Text = 'Handed {0} to {1} using a {2} checkpoint.' -f $Plan.Source.Project, $Plan.TargetAgent, $StatusSource
     if ($script:launcherView -eq 'live') { Refresh-LiveSessions }
@@ -4437,6 +5499,8 @@ $script:plannedHandoffTimer.Add_Tick({ Process-PlannedHandoffs })
 $script:plannedHandoffTimer.Start()
 
 function Exit-HandoffMode {
+    $uiSessionRole.Enabled = $true
+    $uiTerminalHost.Enabled = $true
     if ($script:handoffWait) { $script:handoffWait = $null }
     $script:handoffSource = $null
     $script:handoffWorkspace = ''
@@ -4446,19 +5510,20 @@ function Exit-HandoffMode {
     $uiHandoffTimingLabel.Visible = $false
     $uiHandoffCancel.Visible = $false
     $uiCancel.Visible = $true
-    $uiStart.Left = 526
+    Set-ActionButtonPositions
     $form.CancelButton = $uiCancel
     $uiStartMode.Tag.Visible = $true
     $uiStartLabel.Text = 'Start'
-    $uiPromptLabel.Location = New-Object System.Drawing.Point(196, 282)
-    $uiPromptLabel.Size = New-Object System.Drawing.Size(400, $uiPromptLabel.Height)
-    $uiPrompt.Parent.Location = New-Object System.Drawing.Point(196, 304)
-    $uiPrompt.Parent.Size = New-Object System.Drawing.Size(576, 26)
-    $uiPrompt.Size = New-Object System.Drawing.Size(566, $uiPrompt.Height)
+    $uiPromptLabel.Location = New-Object System.Drawing.Point(650, 282)
+    $uiPromptLabel.Size = New-Object System.Drawing.Size(322, $uiPromptLabel.Height)
+    $uiPrompt.Parent.Location = New-Object System.Drawing.Point(650, 304)
+    $uiPrompt.Parent.Size = New-Object System.Drawing.Size(322, 26)
+    $uiPrompt.Size = New-Object System.Drawing.Size(312, $uiPrompt.Height)
     $uiStart.Text = '[ Open terminal ]'
     $uiProject.Enabled = $true
-    $uiProjectBrowse.Enabled = $true
-    $uiProjectRemove.Enabled = $true
+    Set-ThemeButtonAvailable $uiProjectBrowse $true
+    Set-ThemeButtonAvailable $uiProjectRemove $true
+    Set-RowTip $uiSessionRole 'Ordinary opens the selected CLI normally. Orchestrator delegates project work and runs its managed checks and repairs.'
     Update-Details
 }
 
@@ -4468,6 +5533,12 @@ function Enter-HandoffMode {
         [void][System.Windows.Forms.MessageBox]::Show($form, 'The session workspace is no longer available.', 'Cannot hand off')
         return
     }
+    $script:suspendSessionPreference = $true
+    try { $uiSessionRole.SelectedItem = 'Ordinary' } finally { $script:suspendSessionPreference = $false }
+    # The receiving session is always an ordinary one; Orchestrator starts its
+    # own managed session. Where it opens is still the user's choice.
+    $uiSessionRole.Enabled = $false
+    Set-RowTip $uiSessionRole 'A handoff always opens an Ordinary session. Orchestrator starts its own managed session instead.'
     $script:handoffSource = $Session
     $script:handoffWorkspace = (Resolve-Path -LiteralPath $Session.Workspace).ProviderPath
     $row = @($script:projectRows | Where-Object { Test-SamePath $_.Path $script:handoffWorkspace }) | Select-Object -First 1
@@ -4482,8 +5553,8 @@ function Enter-HandoffMode {
     }
     $uiProject.SelectedItem = $row.Display
     $uiProject.Enabled = $false
-    $uiProjectBrowse.Enabled = $false
-    $uiProjectRemove.Enabled = $false
+    Set-ThemeButtonAvailable $uiProjectBrowse $false
+    Set-ThemeButtonAvailable $uiProjectRemove $false
     $targetAgent = if ([string]$Session.Agent -eq 'Claude') { 'Codex' } else { 'Claude' }
     $uiAgent.SelectedItem = $targetAgent
     Load-AgentModel $targetAgent
@@ -4496,24 +5567,24 @@ function Enter-HandoffMode {
     $uiHandoffTimingLabel.Visible = $true
     $uiHandoffCancel.Visible = $true
     $uiCancel.Visible = $false
-    $uiStart.Left = 452
+    Set-ActionButtonPositions
     $form.CancelButton = $uiHandoffCancel
     # WinForms assigns DialogResult.Cancel to a form's CancelButton. That would
     # close ShowDialog after our click handler, so keep this mode-exit button inert.
     $uiHandoffCancel.DialogResult = [System.Windows.Forms.DialogResult]::None
     $uiStartMode.Tag.Visible = $false
     $uiStartLabel.Text = 'Status'
-    $uiPromptLabel.Location = New-Object System.Drawing.Point(532, 282)
-    $uiPromptLabel.Size = New-Object System.Drawing.Size(240, $uiPromptLabel.Height)
-    $uiPrompt.Parent.Location = New-Object System.Drawing.Point(532, 304)
-    $uiPrompt.Parent.Size = New-Object System.Drawing.Size(240, 26)
-    $uiPrompt.Size = New-Object System.Drawing.Size(230, $uiPrompt.Height)
+    $uiPromptLabel.Location = New-Object System.Drawing.Point(768, 282)
+    $uiPromptLabel.Size = New-Object System.Drawing.Size(204, $uiPromptLabel.Height)
+    $uiPrompt.Parent.Location = New-Object System.Drawing.Point(768, 304)
+    $uiPrompt.Parent.Size = New-Object System.Drawing.Size(204, 26)
+    $uiPrompt.Size = New-Object System.Drawing.Size(194, $uiPrompt.Height)
     $uiStart.Text = '[ Plan / hand off ]'
     $uiPrompt.Text = ''
     Update-Details
     $uiProject.Enabled = $false
-    $uiProjectBrowse.Enabled = $false
-    $uiProjectRemove.Enabled = $false
+    Set-ThemeButtonAvailable $uiProjectBrowse $false
+    Set-ThemeButtonAvailable $uiProjectRemove $false
     Set-LauncherView 'new'
     $uiHandoffStatus.Focus()
 }
@@ -4730,6 +5801,8 @@ $uiVaultLinkSet.Add_Click({
 })
 
 $uiProjectBrowse.Add_Click({
+    # In a handoff the folder is fixed; the button stays visible but does nothing.
+    if ($null -ne $uiProjectBrowse.Tag -and -not [bool]$uiProjectBrowse.Tag) { return }
     # A work folder can be a project or a notes folder.
     $picked = Show-FolderPicker -Roots @($codeProjectsRoot, $vaultRoot) -AllowAnywhere `
         -Title 'Choose a work folder' -Initial (Get-SelectedProjectPath)
@@ -4746,6 +5819,7 @@ $uiProjectBrowse.Add_Click({
 })
 
 $uiProjectRemove.Add_Click({
+    if ($null -ne $uiProjectRemove.Tag -and -not [bool]$uiProjectRemove.Tag) { return }
     $workPath = Get-SelectedProjectPath
     if (-not $workPath) { return }
     if ($script:projectRows.Count -le 1) { return }
@@ -4839,6 +5913,7 @@ function Start-HandoffFromUi {
                 TargetEffort = $targetEffort
                 TargetPersona = $targetPersona
                 TargetWeb = $targetWeb
+                TargetHost = [string]$uiTerminalHost.SelectedItem
                 Contexts = @(Get-AttachedContextPaths)
                 Requested = $false
                 RequestedAt = [datetime]::MinValue
@@ -4865,9 +5940,17 @@ function Start-HandoffFromUi {
         }
         $statusText = ''
         $statusSource = 'none'
+        $manualReason = ''
         if ($statusChoice -eq 'Session writes it') {
             $request = Get-HandoffRequest -Handoff $handoff
             $sendStatus = Send-SessionCommand -Session $source -Command $request
+            # Said in the status dialog, so a fallback to writing it by hand is
+            # not unexplained.
+            $manualReason = if ($sendStatus -ne 'sent') {
+                Get-TabAgentReason $sendStatus
+            } else {
+                'it did not finish a complete status within 45 seconds'
+            }
             if ($sendStatus -eq 'sent') {
                 $started = Get-Date
                 $lastStamp = ''
@@ -4887,7 +5970,7 @@ function Start-HandoffFromUi {
         }
         if (-not $statusText) {
             do {
-                $statusText = Get-ManualHandoffStatus -Handoff $handoff
+                $statusText = Get-ManualHandoffStatus -Handoff $handoff -Reason $manualReason
                 if ($null -eq $statusText) {
                     Remove-HandoffFiles -Handoff $handoff
                     return
@@ -4914,8 +5997,35 @@ function Start-HandoffFromUi {
     }
 }
 
+# Role is per session; it never overwrites saved Ordinary project settings.
+$uiSessionRole.Add_SelectedIndexChanged({
+    $ordinary = ([string]$uiSessionRole.SelectedItem -eq 'Ordinary')
+    if (-not $script:handoffSource -and -not $script:suspendSessionPreference) {
+        $script:lastSessionRole = [string]$uiSessionRole.SelectedItem
+        Save-LauncherSettings
+    }
+    foreach ($control in @($uiMode, $uiStartMode, $uiPrompt, $uiPersona, $uiWeb, $advanced)) { $control.Enabled = $true }
+    $uiRoleNote.Text = if ($ordinary) { '' } else { 'Delegation, tests and automatic repair' }
+    Update-Details
+})
+
 $uiStart.Add_Click({
     try {
+        if ([string]$uiSessionRole.SelectedItem -eq 'Orchestrator') {
+            if ($script:handoffSource) { throw 'Orchestrator starts a new managed session. Choose Ordinary for an existing handoff.' }
+            Import-OrchestratorEntry
+            $orchestratorProject = Get-SelectedProjectPath
+            $orchestratorContexts = @(Get-OrchestratorContextPaths -ProjectPath $orchestratorProject -Attached @(Get-AttachedContextPaths))
+            $preview = Get-OrchestratorPreview -SelectedAgent ([string]$uiAgent.SelectedItem) -WorkingDirectory $orchestratorProject -AdapterPath $OrchestratorAdapter -Contexts $orchestratorContexts -Model (Get-ModelSlug ([string]$uiModel.SelectedItem)) -Start ([string]$uiStartMode.SelectedItem) -Prompt ([string]$uiPrompt.Text) -Effort ([string]$uiEffort.SelectedItem)
+            $null = Start-OrchestratorTerminal $preview
+            $script:lastAgent = [string]$uiAgent.SelectedItem
+            $script:lastProject = $orchestratorProject
+            Save-ProjectContexts
+            Save-AgentModel
+            Save-LauncherSettings
+            $uiPrompt.Clear()
+            return
+        }
         if ($script:handoffSource) {
             Start-HandoffFromUi
             return
@@ -4932,15 +6042,14 @@ $uiStart.Add_Click({
         $webName = [string]$uiWeb.SelectedItem
         $preview = Get-LaunchPreview -SelectedAgent $agentName -WorkingDirectory $workPath -ContextDirectories $contexts -SelectedModel $modelName -SelectedMode $modeName -StartMode $startName -OpeningPrompt $promptText -SelectedEffort $effortName -SelectedPersona $personaName -SelectedWeb $webName
 
-        # Check at the moment of launch instead of decorating the project list
-        # from a snapshot that becomes stale when a terminal is closed.
-        $liveNow = @(Get-LiveAgentSessions)
-        $sameFolder = @($liveNow | Where-Object { Test-LiveSessionProject $_ $workPath })
-        if ($sameFolder.Count -gt 0) {
-            $activeResume = $null
-            if ($preview.StartMode -eq 'Continue last') {
-                $activeResume = $sameFolder | Where-Object { $_.Agent -eq $preview.Agent } | Select-Object -First 1
-            }
+        # A second session in a folder that already has one is allowed without
+        # asking. The one case that cannot work is resuming the very session
+        # that is still open, so that is the only thing checked, at the moment
+        # of launch rather than from a snapshot that goes stale.
+        if ($preview.StartMode -eq 'Continue last') {
+            $activeResume = @(Get-LiveAgentSessions) | Where-Object {
+                $_.Agent -eq $preview.Agent -and (Test-LiveSessionProject $_ $workPath)
+            } | Select-Object -First 1
             if ($activeResume) {
                 [void][System.Windows.Forms.MessageBox]::Show(
                     $form,
@@ -4951,19 +6060,6 @@ $uiStart.Add_Click({
                 )
                 return
             }
-
-            $sessionLines = @($sameFolder | ForEach-Object {
-                $modelText = if ($_.Model) { ' ' + [char]0x2014 + ' ' + $_.Model } else { '' }
-                ([string][char]0x2022) + ' ' + $_.Agent + $modelText
-            }) -join "`r`n"
-            $answer = [System.Windows.Forms.MessageBox]::Show(
-                $form,
-                ("There is already an active session in '{0}':`r`n`r`n{1}`r`n`r`nStart another session in the same folder?" -f (Split-Path -Leaf $workPath), $sessionLines),
-                'Session already running',
-                [System.Windows.Forms.MessageBoxButtons]::YesNo,
-                [System.Windows.Forms.MessageBoxIcon]::Warning
-            )
-            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
         }
         $script:lastAgent      = $agentName
         $script:lastProject    = $workPath
@@ -4974,11 +6070,13 @@ $uiStart.Add_Click({
         Start-AgentTerminal -SelectedAgent $agentName -WorkingDirectory $workPath `
             -ContextDirectories $contexts -SelectedModel $modelName -SelectedMode $modeName `
             -StartMode $startName -OpeningPrompt $promptText `
-            -SelectedEffort $effortName -SelectedPersona $personaName -SelectedWeb $webName
+            -SelectedEffort $effortName -SelectedPersona $personaName -SelectedWeb $webName `
+            -SessionTitle ([string]$uiSessionTitle.Text)
         # The launcher stays open for another session. The opening prompt has
         # already been handed to the terminal, so do not leave it looking like
         # an unsent draft. A failed launch throws above and deliberately keeps it.
         $uiPrompt.Clear()
+        $uiSessionTitle.Clear()
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, 'Cannot start agent')
     }
@@ -4989,6 +6087,9 @@ $uiStart.Add_Click({
 Update-Layout
 Refresh-ProjectList -KeepSelected $script:lastProject
 Load-ProjectContexts (Get-SelectedProjectPath)
+$uiSessionRole.SelectedItem = $script:lastSessionRole
+if ($loaded.LastTerminalHost -eq 'Herdr isolated') { $loaded.LastTerminalHost = 'Herdr' }
+if ($loaded.LastTerminalHost -in @('Terminal','Herdr')) { $uiTerminalHost.SelectedItem = [string]$loaded.LastTerminalHost }
 if ($script:lastAgent -and $uiAgent.Items.Contains($script:lastAgent)) { $uiAgent.SelectedItem = $script:lastAgent }
 Load-AgentModel ([string]$uiAgent.SelectedItem)
 Refresh-EffortChoices

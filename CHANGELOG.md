@@ -2,6 +2,117 @@
 
 ## Unreleased
 
+- Handoff, status dialog: it now says what the status is for (the briefing the receiving agent starts
+  from, since it does not see the old conversation: goal, done, in progress, next steps) and why it
+  appeared, for example that the source session could not be asked to write it. The text box no
+  longer opens with every heading selected, so typing does not wipe them.
+- Handoff and **Compact** work for sessions in Herdr. With **Session writes it** the launcher types
+  the handoff request into the source's Herdr pane (`pane send-text`, then Enter) and the session
+  writes its own status, so nothing has to be written by hand. **Compact** and **Compact all** type
+  `/compact` the same way. A Herdr pane has no window to bring forward, so it is typed into where
+  it is; anything already typed but unsent in it is sent along. Writing the status by hand is now
+  only the fallback when the session cannot be reached or does not finish within 45 seconds.
+- Handoff layout: **Cancel handoff** was drawn under a second, ordinary **Cancel** button, which
+  closes the whole launcher. Only the handoff Cancel is shown now. **Browse** and **Remove** are
+  readable (dimmed) while the folder is fixed, and **Terminal** can be chosen, so the receiving
+  session can open in Herdr. **Role** stays Ordinary, with a hint saying why. Status, When? and Note
+  line up with their labels again.
+
+- Fixed every Herdr lookup failing silently in a launcher started from the desktop shortcut, which is
+  why Herdr tab names never reached Live sessions and Go to this session did not work for Herdr.
+  The launcher's Herdr server runs in a private environment (`XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
+  `HERDR_*`) that holds its socket. A launcher started from a terminal inside Herdr inherited it, one
+  started from the shortcut did not, so the Herdr CLI looked in the default folder and found nothing.
+  The launcher now reads that environment from the Herdr server process and uses it for its calls.
+
+- Fixed Herdr tab names never reaching Live sessions in a launcher that had been open for a while.
+  The launcher remembered which tab each process sat in and kept using it after tabs were moved,
+  renamed or closed, so the name was looked up in a tab that no longer existed. It now takes a fresh
+  picture of Herdr on every refresh (at most every four seconds) and also finds a pane through its
+  shell, so an agent that is running a tool is still found.
+
+- A session in Herdr is titled with its tab name exactly as Herdr shows it, including a bare tab
+  number or "Terminal". The launcher no longer substitutes a title of its own for those. A title
+  you gave in New session or with **Set session title** still wins. Refresh re-reads the tab names.
+
+- New session has an optional **Title** field. A title typed there is the session's name in Live
+  sessions and, for sessions in Herdr, the name of its Herdr tab. Left empty, the launcher names
+  the session after what it is working on as before. The title is kept under the session's marker
+  in `session-titles.json`, so it survives a launcher restart. A title set later with **Set session
+  title** is put on the Herdr tab the next time Live sessions refreshes. The launcher names a tab
+  once; if you rename it in Herdr afterwards, it is not renamed back. Role, Terminal and Start got
+  narrower to make room, and the field is not shown for Orchestrator or handoff.
+
+- **Go to this session** on a session in a private Herdr server (one the launcher has no session
+  name for, such as an Orchestrator pilot) now says so instead of "tab not found".
+
+- Live sessions: a Codex session started with `codex resume` (for example `resume --last`) is now
+  matched to the transcript it resumed, so it shows its real model, effort, context and title
+  instead of "New session" and "waiting". A resumed session keeps writing to the rollout it was
+  created in, which can be days old, and the launcher only looked in today's folder.
+- Live sessions: an Orchestrator session is listed again. The workflow controller starts it
+  through Python processes, which the launcher did not follow up to the terminal, so it was
+  skipped. Its transcript is read from the folder it runs in rather than the project's. Old
+  controller sessions left in private pilot Herdr servers are still left out, and a Herdr tab
+  named just "Terminal" no longer becomes the session title.
+
+- Live sessions: **Compact all** and **Refresh** sit against the right edge, and the session
+  table starts 12 px lower so the Claude and Codex limit lines have room above the column headers.
+  The window opens 12 px taller to fit.
+- New session layout fills the whole width. Browse, Remove and Link sit against the right edge and
+  the work-folder field and the lines under it run out to them; Agent, Model, Effort and
+  Permissions share the full width; Role and Terminal moved down into the Session row beside Start
+  and First message (Status, When? and Note in handoff mode); and Open terminal / Cancel sit at the
+  panel's right edge. The "Also in scope" row under Advanced options follows the same pattern.
+- **Go to this session** works for sessions in Herdr. They share one Windows Terminal tab, so the
+  launcher asks Herdr to focus the session's pane (`agent focus`) and then brings the Herdr
+  window to the front. Codex panes are found too: Herdr reports the `cmd.exe` shim above
+  `node` and `codex.exe`, so every process from the agent up to its terminal is matched. Only the
+  launcher's own Herdr session (`orch-launcher-spaces`) is reachable; sessions under other Herdr
+  servers still say the tab was not found. **Compact** still types into a Windows Terminal tab and
+  does not reach Herdr panes.
+- Account limits are shown once, at the top of Live sessions, instead of in a Limits column on
+  every row: **Claude** in orange and **Codex** in blue, one above the other with the numbers
+  aligned, in place of the description line. The number is green below 60%, amber from 60% and
+  red from 80%, by the higher of the 5-hour and 7-day windows. Hover either for the reset times.
+  An agent with no live session is left out.
+- A session in Herdr takes its title from the tab name you gave it in Herdr (for example
+  "til afklaring") instead of one the launcher derives. Untitled Herdr tabs and a title set with
+  **Set session title** are unchanged: the launcher's own title still wins. The launcher finds the
+  tab through Herdr's read-only CLI (`tab list`, `agent list`, `pane process-info`).
+- Live sessions now lists a `claude` or `codex` started by hand in a Herdr pane. It runs under the
+  pane's own shell with no PowerShell in between, which the launcher used to skip. Claude sessions
+  without a launcher marker are placed through Claude's own `~/.claude/sessions/<pid>.json`
+  registry (session id and working folder), so their project, transcript, title, effort and
+  context are exact instead of guessed from timestamps.
+- Starting a session in a folder that already has one no longer asks for confirmation. Only
+  **Continue last** on a session that is still open is refused, because it cannot work.
+- Sessions that the launcher started inside Herdr now show their real project instead of
+  "(external)". Herdr passes the shell's setup as a base64 `-EncodedCommand`; the launcher now
+  decodes it to read the workspace. The row tooltip says whether a session runs in Herdr or
+  Windows Terminal. Prompt-based titles also skip text that starts with a quote mark (pasted
+  replies) and attachment markers like "[Image #2]".
+- Live sessions are titled by what they are working on instead of "Session HH:mm". A title you set
+  with **Set session title** still wins. Otherwise Codex uses its own thread name, and Claude uses
+  `/rename` (or an external `--name`), then its own summary, then the latest real prompt boiled
+  down to one line. Hover a row to see where its title came from. "New session HH:mm" only
+  shows before the first prompt has been sent.
+- Live sessions now read model, effort and context for every session. Codex terminal sessions
+  started on older builds (rollout tagged `source=vscode` instead of `cli`) were never matched to
+  their transcript and showed "default / waiting". Claude sessions started outside the launcher
+  with `--name` are now found by that name across all project folders instead of being skipped.
+- Simplified terminal selection to Terminal or Herdr. Herdr always adds projects to the same shared session; older saved isolated preferences migrate to Herdr.
+- Fixed adding a second project to the shared Herdr session: the workspace helper is now imported into the launcher scope even after Herdr preflight has loaded its other helpers. The persistent outer Windows Terminal tab is titled **Herdr**; project names remain in Herdr's Spaces sidebar.
+- Successful Herdr workspace replies may omit `needs_client`; both PowerShell callers now handle that optional field under strict mode. A regression exercises the real console and workspace helpers and checks that no second terminal opens.
+
+- Herdr now keeps one persistent launcher session and opens later projects as focused workspaces in its Spaces sidebar, without another terminal tab. `Herdr isolated` retains the previous per-launch private-session behavior; Terminal remains the default.
+
+- The desktop and Start menu shortcuts now start the launcher in a detached hidden PowerShell process, so closing a terminal window does not close the launcher.
+- The launcher now has its own Windows taskbar identity, keeping its taskbar button with the launcher icon instead of grouping it under PowerShell.
+- Live session agent names use orange for Claude and blue for Codex.
+- Live sessions show each editable, locally saved title after its project name in one sortable Project column. Drag the handles between columns to adjust their spacing; widths are saved and reflow with the window.
+- New session content stays a fixed, readable width and remains centered as the launcher window grows; its action buttons stay centered below it.
+- The launcher window is wider by default and can be resized horizontally to make more room for session titles.
 - The launcher starts again when a saved project or attached folder is on a network share whose
   host is offline. Such folders are skipped instead of stopping startup with "The network path
   was not found", and a quick check of the share's host avoids the long Windows timeout per path.

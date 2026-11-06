@@ -16,7 +16,7 @@ $checksum = $zip + '.sha256'
 try {
     [void](New-Item -ItemType Directory -Path $package -Force)
     [void](New-Item -ItemType Directory -Path (Join-Path $package 'icons') -Force)
-    foreach ($name in @('AgentProjectLauncher.ps1', 'Install.ps1', 'Uninstall.ps1', 'README.md', 'LICENSE', 'CHANGELOG.md')) {
+    foreach ($name in @('AgentProjectLauncher.ps1', 'OrchestratorEntry.ps1', 'HerdrEntry.ps1', 'ORCHESTRATOR.md', 'HERDR.md', 'Start-AgentProjectLauncher.vbs', 'Install.ps1', 'Uninstall.ps1', 'README.md', 'LICENSE', 'CHANGELOG.md')) {
         Copy-Item -LiteralPath (Join-Path $source $name) -Destination $package -Force
     }
     Copy-Item -LiteralPath (Join-Path $source 'icons\agent-launcher.ico') -Destination (Join-Path $package 'icons') -Force
